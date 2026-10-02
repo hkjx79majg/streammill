@@ -11,7 +11,9 @@ from urllib.parse import unquote, urlsplit
 
 from .service import (
     EventIdConflictError,
+    RestoreConflictError,
     Service,
+    SnapshotError,
     StreamExistsError,
     StreamNotFoundError,
     WatermarkRegressionError,
@@ -131,6 +133,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.health())
             return
         segments = self._segments()
+        if segments == ["snapshot"]:
+            self.send_json(200, self.service.snapshot())
+            return
         if len(segments) == 3 and segments[0] == "streams" and segments[2] == "results":
             try:
                 self.send_json(200, self.service.results(segments[1]))
@@ -150,6 +155,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(segments) == 3 and segments[0] == "streams" and segments[2] == "watermark":
                 self._advance_watermark(segments[1])
+                return
+            if segments == ["snapshot", "restore"]:
+                self._restore_snapshot()
                 return
         except _RequestError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
@@ -203,6 +211,20 @@ class Handler(BaseHTTPRequestHandler):
         except WatermarkRegressionError:
             raise _RequestError(409, "watermark_regression", "watermark must not move backwards") from None
         self.send_json(200, payload)
+
+    def _restore_snapshot(self) -> None:
+        document = self._read_json()
+        try:
+            restored = self.service.restore_snapshot(document)
+        except RestoreConflictError:
+            raise _RequestError(
+                409,
+                "restore_conflict",
+                "snapshot restore is only allowed on an instance without streams",
+            ) from None
+        except SnapshotError as exc:
+            raise _RequestError(422, "invalid_snapshot", str(exc)) from None
+        self.send_json(200, {"restored_streams": restored})
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""

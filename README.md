@@ -28,10 +28,17 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 
 错误统一为 `{"error": {"code", "message"}}`：非法 JSON 返回 400 `invalid_json`；缺字段、类型错误、配置越界、非有限数值或含未声明字段返回 422 `invalid_request`，且不留部分状态；访问不存在的流返回 404 `stream_not_found`。
 
+## 全量状态快照与恢复
+
+- `GET /snapshot` 返回一致时点的全量状态文档 `{"format_version": 1, "streams": [...]}`。导出在同一把状态锁内完成，期间的创建流、提交事件与推进水位线要么整体包含、要么整体不包含；普通接口不产生任何落盘副作用。
+- `streams` 按流名升序。每个流对象包含 `name`、`window_ms`、`allowed_lateness_ms`、`dedup_retention_ms`（未启用去重时为 `null`，且无 `dedup_records`）、`watermark_ms`（未推进时为 `null`）、尚未最终关闭的 `windows`、已经最终化的 `finalized`；启用去重时还包含保留期内的 `dedup_records`（`event_id`、`timestamp_ms`、`value`）。`windows` 与 `finalized` 的窗口对象为 `window_start_ms`、`window_end_ms`、`count`、`sum`，`finalized` 行另含 `stream`；两个数组均按 `window_start_ms` 升序，`dedup_records` 按 `event_id` 升序。
+- `POST /snapshot/restore` 仅允许在尚未创建任何流的实例上调用，成功返回 200 `{"restored_streams": N}` 并一次性发布全部状态，其他请求不会观察到部分流；空快照 `{"format_version": 1, "streams": []}` 合法并返回零。恢复后结果查询与导出前一致，开放窗口可继续接收合规事件并在后续水位线下正确最终化，已最终化窗口不会再次进入 `finalized`，保留的标识继续执行重复/冲突判断且淘汰边界不变；无写入的再次导出在语义与数组顺序上完全相同。
+- 恢复严格校验且不静默修正：请求体不是合法 JSON 返回 400 `invalid_json`；对象结构、字段类型、`format_version`（仅支持 1，其他版本同样拒绝）、流名唯一性与升序、配置约束（含 `dedup_retention_ms >= allowed_lateness_ms`）、数组排序、窗口边界对齐与开闭关系、最终结果与水位线/迟到配置的关系、重复窗口或重复 `event_id`、去重记录的保留期边界与所属窗口计数关系任一不合法，均返回 422 `invalid_snapshot`，实例保持完全为空。实例中已存在任意流时，对任何可解析的快照文档都返回 409 `restore_conflict`（请求体本身不是合法 JSON 时仍按请求格式错误返回 400 `invalid_json`），原状态不变。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-重启恢复、连接、持久化与自动水位线仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。
+快照覆盖进程内全量状态，可用于跨实例/重启的人工恢复；连接、落盘持久化与自动水位线仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。
