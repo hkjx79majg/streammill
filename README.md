@@ -12,6 +12,15 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 
 服务默认监听 `127.0.0.1:8080`，可通过 `STREAMMILL_ADDR` 修改。`GET /healthz` 返回 JSON 健康状态。
 
+## 事件时间滚动窗口
+
+- `POST /streams`：创建具名流，请求体为 `{"name": ..., "window_ms": 正整数, "allowed_lateness_ms": 非负整数}`。
+- `POST /streams/{name}/events`：提交事件 `{"timestamp_ms": 整数, "value": 有限数值}`。事件归入左闭右开窗口，起点为 `timestamp_ms` 对 `window_ms` 向下取整。晚于水位线容忍边界的事件返回 `{"dropped": true}` 且不改变聚合。
+- `POST /streams/{name}/watermark`：显式推进水位线 `{"watermark_ms": 整数}`，不得回退。当水位线达到 `window_end_ms + allowed_lateness_ms` 时窗口最终化，响应中按窗口结束时间递增返回本次结果（`stream`、`window_start_ms`、`window_end_ms`、`count`、`sum`）；空窗口不产生结果，重复水位线不重复结果。
+- `GET /streams/{name}/results`：返回该流当前全部最终窗口。
+
+错误码：`stream_exists`（409）、`stream_not_found`（404）、`watermark_regression`（409）、`invalid_json`（400）、`invalid_request`（422）、未知路由 `not_found`（404），均沿用 `{"error": {"code", "message"}}` 结构。各流状态彼此隔离；本版本不包含重启恢复、去重、持久化与自动水位线。
+
 ## 验证
 
 ```bash
