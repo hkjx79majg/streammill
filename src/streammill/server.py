@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from .service import (
+    EventIdConflictError,
     Service,
     StreamExistsError,
     StreamNotFoundError,
@@ -56,20 +57,30 @@ _CREATE_FIELDS = {
     "window_ms": lambda v: _is_int(v) and v > 0,
     "allowed_lateness_ms": lambda v: _is_int(v) and v >= 0,
 }
+_CREATE_OPTIONAL_FIELDS = {
+    "dedup_retention_ms": lambda v: _is_int(v) and v > 0,
+}
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
     "value": _is_finite_number,
+}
+_EVENT_FIELDS_DEDUP = {
+    **_EVENT_FIELDS,
+    "event_id": lambda v: isinstance(v, str) and len(v) > 0,
 }
 _WATERMARK_FIELDS = {
     "watermark_ms": _is_int,
 }
 
 
-def _validate(body: object, fields: dict) -> dict:
+def _validate(
+    body: object, fields: dict, optional: dict | None = None
+) -> dict:
     """Check required fields, types and reject undeclared fields."""
     if not isinstance(body, dict):
         raise _invalid_request("request body must be a JSON object")
-    extra = sorted(set(body) - set(fields))
+    optional = optional or {}
+    extra = sorted(set(body) - set(fields) - set(optional))
     if extra:
         raise _invalid_request(f"unexpected fields: {', '.join(extra)}")
     values = {}
@@ -80,6 +91,12 @@ def _validate(body: object, fields: dict) -> dict:
         if not check(value):
             raise _invalid_request(f"invalid value for field: {field}")
         values[field] = value
+    for field, check in optional.items():
+        if field in body:
+            value = body[field]
+            if not check(value):
+                raise _invalid_request(f"invalid value for field: {field}")
+            values[field] = value
     return values
 
 
@@ -143,21 +160,58 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def _create_stream(self) -> None:
-        values = _validate(self._read_json(), _CREATE_FIELDS)
+        values = _validate(
+            self._read_json(), _CREATE_FIELDS, optional=_CREATE_OPTIONAL_FIELDS
+        )
+        dedup_retention_ms = values.get("dedup_retention_ms")
+        if (
+            dedup_retention_ms is not None
+            and dedup_retention_ms < values["allowed_lateness_ms"]
+        ):
+            raise _invalid_request(
+                "dedup_retention_ms must be at least allowed_lateness_ms"
+            )
         try:
             payload = self.service.create_stream(
-                values["name"], values["window_ms"], values["allowed_lateness_ms"]
+                values["name"],
+                values["window_ms"],
+                values["allowed_lateness_ms"],
+                dedup_retention_ms,
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
         self.send_json(201, payload)
 
     def _add_event(self, name: str) -> None:
-        values = _validate(self._read_json(), _EVENT_FIELDS)
+        # Parsing precedes everything else, preserving the baseline
+        # 400 invalid_json precedence; the accepted field set then
+        # depends on the addressed stream's configuration.
+        body = self._read_json()
         try:
-            payload = self.service.add_event(name, values["timestamp_ms"], values["value"])
+            dedup_enabled = self.service.is_dedup_enabled(name)
+        except StreamNotFoundError:
+            # Preserve baseline precedence: a malformed body addressed at
+            # an unknown stream is rejected as invalid_request before the
+            # 404, exactly as without deduplication support.
+            _validate(body, _EVENT_FIELDS)
+            raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        fields = _EVENT_FIELDS_DEDUP if dedup_enabled else _EVENT_FIELDS
+        values = _validate(body, fields)
+        try:
+            payload = self.service.add_event(
+                name,
+                values["timestamp_ms"],
+                values["value"],
+                values.get("event_id"),
+            )
         except StreamNotFoundError:
             raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        except EventIdConflictError:
+            raise _RequestError(
+                409,
+                "event_id_conflict",
+                f"event_id already used with a different timestamp or value: {values['event_id']}",
+            ) from None
         self.send_json(200, payload)
 
     def _advance_watermark(self, name: str) -> None:
