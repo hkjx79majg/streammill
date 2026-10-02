@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
 
-from .service import Service
+from .service import (
+    Service,
+    StreamExistsError,
+    StreamNotFoundError,
+    WatermarkRegressionError,
+)
 
 
 def env_address() -> tuple[str, int]:
@@ -16,6 +23,64 @@ def env_address() -> tuple[str, int]:
     if not host or not port.isdigit():
         raise SystemExit(f"invalid STREAMMILL_ADDR: {raw!r}")
     return host, int(port)
+
+
+class _RequestError(Exception):
+    """Validation or domain failure mapped onto a JSON error response."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+def _invalid_request(message: str) -> _RequestError:
+    return _RequestError(422, "invalid_request", message)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+_CREATE_FIELDS = {
+    "name": lambda v: isinstance(v, str) and len(v) > 0,
+    "window_ms": lambda v: _is_int(v) and v > 0,
+    "allowed_lateness_ms": lambda v: _is_int(v) and v >= 0,
+}
+_EVENT_FIELDS = {
+    "timestamp_ms": _is_int,
+    "value": _is_finite_number,
+}
+_WATERMARK_FIELDS = {
+    "watermark_ms": _is_int,
+}
+
+
+def _validate(body: object, fields: dict) -> dict:
+    """Check required fields, types and reject undeclared fields."""
+    if not isinstance(body, dict):
+        raise _invalid_request("request body must be a JSON object")
+    extra = sorted(set(body) - set(fields))
+    if extra:
+        raise _invalid_request(f"unexpected fields: {', '.join(extra)}")
+    values = {}
+    for field, check in fields.items():
+        if field not in body:
+            raise _invalid_request(f"missing required field: {field}")
+        value = body[field]
+        if not check(value):
+            raise _invalid_request(f"invalid value for field: {field}")
+        values[field] = value
+    return values
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -29,11 +94,81 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_error_json(self, status: int, code: str, message: str) -> None:
+        self.send_json(status, {"error": {"code": code, "message": message}})
+
+    def _segments(self) -> list[str]:
+        path = urlsplit(self.path).path
+        return [unquote(part) for part in path.split("/") if part]
+
+    def _read_json(self) -> object:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise _RequestError(400, "invalid_json", "request body is not valid JSON") from None
+
     def do_GET(self) -> None:
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
+        segments = self._segments()
+        if len(segments) == 3 and segments[0] == "streams" and segments[2] == "results":
+            try:
+                self.send_json(200, self.service.results(segments[1]))
+            except StreamNotFoundError:
+                self.send_error_json(404, "stream_not_found", f"unknown stream: {segments[1]}")
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def do_POST(self) -> None:
+        segments = self._segments()
+        try:
+            if segments == ["streams"]:
+                self._create_stream()
+                return
+            if len(segments) == 3 and segments[0] == "streams" and segments[2] == "events":
+                self._add_event(segments[1])
+                return
+            if len(segments) == 3 and segments[0] == "streams" and segments[2] == "watermark":
+                self._advance_watermark(segments[1])
+                return
+        except _RequestError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def _create_stream(self) -> None:
+        values = _validate(self._read_json(), _CREATE_FIELDS)
+        try:
+            payload = self.service.create_stream(
+                values["name"], values["window_ms"], values["allowed_lateness_ms"]
+            )
+        except StreamExistsError:
+            raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
+        self.send_json(201, payload)
+
+    def _add_event(self, name: str) -> None:
+        values = _validate(self._read_json(), _EVENT_FIELDS)
+        try:
+            payload = self.service.add_event(name, values["timestamp_ms"], values["value"])
+        except StreamNotFoundError:
+            raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        self.send_json(200, payload)
+
+    def _advance_watermark(self, name: str) -> None:
+        values = _validate(self._read_json(), _WATERMARK_FIELDS)
+        try:
+            payload = self.service.advance_watermark(name, values["watermark_ms"])
+        except StreamNotFoundError:
+            raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        except WatermarkRegressionError:
+            raise _RequestError(409, "watermark_regression", "watermark must not move backwards") from None
+        self.send_json(200, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
