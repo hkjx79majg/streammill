@@ -68,6 +68,15 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - 每次提交后裁掉最旧记录，最多保留 `change_retention` 条，`latest_seq` 不回退。`after_seq` 大于 `latest_seq` 返回 409 `change_cursor_ahead`；仍有保留记录且 `after_seq` 小于最早保留 `seq` 减一时返回 410 `change_cursor_expired`；未知流返回 404 `stream_not_found`，未启用变更流的流返回 409 `change_feed_not_enabled`，错误体沿用 `{"error": {"code", "message"}}`。
 - 存在任意启用变更流的流时 `GET /snapshot` 导出 `format_version: 3`：文档始终携带 `tables` 数组（含既有表与连接状态），启用变更流的流对象额外包含 `change_retention`、`latest_seq` 与保留的 `changes` 记录。恢复兼容 version 1 与 2，并严格校验 version 3：序号连续性（保留记录为以 `latest_seq` 结尾的连续序号，条数不超过 `change_retention` 且在序号超过上限后恰好等于上限）、排序、窗口起点与网格对齐及宽度、记录引用的窗口必须存在、每个窗口至多一条 final 且其后无记录、各窗口最后一条保留记录的 kind 与 `count`/`sum` 必须和该窗口聚合状态一致，任一不合法均返回 422 `invalid_snapshot` 且不发布任何状态。恢复后游标与下一序号连续，继续写入、裁剪与再次导出和未中断实例等价；未启用变更流的实例继续导出版本 1 或 2 的原始形状。
 
+## 可恢复的原子批次写入
+
+- `POST /streams` 可额外携带 `batch_retention`（正整数），限定保留的批次记录条数并在创建响应中回显；不提供时既有响应与快照不变，`POST /streams/{name}/batches` 返回 409 `batch_ingest_not_enabled`。
+- 启用后 `POST /streams/{name}/batches` 接收 `{"batch_id", "events"}`：`batch_id` 为非空字符串，`events` 含 1 至 1000 个元素，各元素遵循该流的单事件字段规则（去重流要求 `event_id`，连接流要求 `lookup_key`，其余字段同样视为未声明）。非法 JSON 返回 400 `invalid_json`；结构错误（含任一元素）返回 422 `invalid_request`；结构合法但流不存在返回 404 `stream_not_found`。
+- 服务先校验全部元素，再在同一状态锁内按输入顺序应用既有的去重、迟到、维表查询、窗口、自动水位线、最终化与变更序号语义，其他请求不会看到中间状态；自动水位线逐项推进，后续元素使用前项处理后的水位线。成功响应为 `{"stream", "batch_id", "outcomes"}`，`outcomes` 与输入同序，每项为对应单事件响应去除 `stream` 后的内容；过迟丢弃与精确重复仍是成功 outcome。
+- 处理中首个标识冲突或维表键缺失分别返回 409 `event_id_conflict`、409 `lookup_key_not_found`，并回滚整个批次：聚合、去重、水位线、最终结果与变更序号均不变，失败请求不占用 `batch_id`。
+- 成功批次保留 `batch_id`、请求与完整响应。保留期内以字段值与事件顺序相同的请求重试，原样返回首次响应且不再写入（重试不刷新保留顺序）；同一 `batch_id` 内容不同返回 409 `batch_id_conflict`。仅保留最近 `batch_retention` 条，淘汰后的标识可复用，并发同标识至多提交一次。
+- 存在任意批次流时 `GET /snapshot` 导出 `format_version: 4`（始终携带 `tables` 数组），对应流额外携带 `batch_retention` 与按提交顺序排列的 `batches` 记录（`batch_id`、`request`、`response`）。恢复兼容 version 1 至 3，并严格校验 version 4：重复标识、记录条数超过 `batch_retention`、请求或响应形状不合法均返回 422 `invalid_snapshot` 且不发布部分状态；恢复后重放与淘汰顺序和未中断实例一致。健康检查、单事件入口、水位线、结果查询、连接与变更流的既有行为不变。
+
 ## 验证
 
 ```bash

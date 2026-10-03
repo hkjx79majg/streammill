@@ -133,11 +133,49 @@ sequence number continue exactly as on the uninterrupted instance.
 Version 1 and 2 documents restore as before, and instances without a
 change feed keep exporting their original versions and shapes.
 
+Streams may optionally enable recoverable atomic batch ingestion by
+passing a positive ``batch_retention`` at creation time (echoed in the
+create response; without it the stream behaves exactly as before and the
+batch entry point raises BatchIngestNotEnabledError). On such streams
+``Service.add_batch`` accepts a non-empty ``batch_id`` plus 1 to 1000
+events that each follow the stream's single-event rules:
+
+* the whole batch is applied at one consistent point, in input order and
+  under the service lock, reusing the per-event dedup, lateness, lookup,
+  window, automatic-watermark, finalization and change-feed semantics —
+  no concurrent request can observe an intermediate state, and on
+  automatic streams each element sees the watermark left by the
+  previous one;
+* the first event-id conflict or unknown lookup key aborts the batch and
+  rolls back every state the earlier elements touched (aggregates, dedup
+  records, watermark, finalized results, joined groups and change
+  sequence), so a failed batch leaves the stream exactly as before and
+  does not occupy its identifier; too-late drops and exact duplicates
+  remain successful outcomes;
+* a successful batch is remembered together with its request and full
+  response. Within the retention a retry carrying the same field values
+  in the same event order replays the stored response without writing
+  again (and without refreshing the retention order), while the same
+  ``batch_id`` with different content raises BatchIdConflictError. Only
+  the newest ``batch_retention`` records are kept; evicted identifiers
+  may be reused, and concurrent submissions of one identifier commit at
+  most once.
+
+Instances with at least one batch-enabled stream export snapshots as
+``format_version`` 4, which always carries the ``tables`` array and, on
+enabled streams, ``batch_retention`` plus the retained batch records in
+commit order. Restore validates the records strictly (identifier
+uniqueness, the retention cap, and the request/response shapes against
+the stream's features) and publishes them so replay and eviction behave
+exactly as on the uninterrupted instance. Older document versions
+restore as before.
+
 Disk persistence remains out of scope.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import threading
 
@@ -146,6 +184,7 @@ from . import __version__
 SNAPSHOT_FORMAT_VERSION = 1
 SNAPSHOT_FORMAT_VERSION_JOIN = 2
 SNAPSHOT_FORMAT_VERSION_CHANGES = 3
+SNAPSHOT_FORMAT_VERSION_BATCHES = 4
 
 
 class StreamExistsError(Exception):
@@ -182,6 +221,14 @@ class ChangeCursorAheadError(Exception):
 
 class ChangeCursorExpiredError(Exception):
     """Raised when a change cursor fell behind the retained records."""
+
+
+class BatchIngestNotEnabledError(Exception):
+    """Raised when submitting a batch to a stream without batch ingest."""
+
+
+class BatchIdConflictError(Exception):
+    """Raised when a retained batch id is resubmitted with different content."""
 
 
 class WatermarkRegressionError(Exception):
@@ -225,6 +272,7 @@ class _Stream:
         slide_ms: int | None = None,
         lookup_table: str | None = None,
         change_retention: int | None = None,
+        batch_retention: int | None = None,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
@@ -239,6 +287,9 @@ class _Stream:
         # Maximum number of retained change-feed records; None disables
         # the feed entirely.
         self.change_retention = change_retention
+        # Maximum number of retained batch records; None disables batch
+        # ingestion entirely.
+        self.batch_retention = batch_retention
         self.watermark: int | None = None
         # Maximum timestamp_ms of a successfully accepted event; only
         # maintained on automatic streams, None until the first such event.
@@ -259,6 +310,9 @@ class _Stream:
         # holds at most change_retention records, oldest first.
         self._latest_seq = 0
         self._changes: list[dict] = []
+        # Retained batch records in commit order, at most batch_retention
+        # of them; each is {"batch_id", "request", "response"}.
+        self._batches: list[dict] = []
 
     @property
     def _step_ms(self) -> int:
@@ -344,6 +398,65 @@ class _Stream:
             newly = self._note_accepted_event(timestamp_ms)
             outcome.update(watermark_ms=self.watermark, finalized=newly)
         return outcome
+
+    def apply_batch(self, events: list[dict], label_of=None) -> list[dict]:
+        """Apply a whole batch atomically, in input order.
+
+        Every element goes through the regular single-event path, so
+        dedup, lateness, lookup, window, automatic-watermark,
+        finalization and change-feed semantics are identical to posting
+        the events one by one; each element observes the state left by
+        the previous ones. The first EventIdConflictError or
+        LookupKeyNotFoundError rolls every mutation back — aggregates,
+        dedup records, watermark, finalized results, joined groups and
+        the change sequence — so a failed batch leaves no trace.
+        """
+        backup = self._state_backup()
+        outcomes: list[dict] = []
+        try:
+            for event in events:
+                outcomes.append(
+                    self.add_event(
+                        event["timestamp_ms"],
+                        event["value"],
+                        event.get("event_id"),
+                        event.get("lookup_key"),
+                        label_of,
+                    )
+                )
+        except Exception:
+            self._state_restore(backup)
+            raise
+        return outcomes
+
+    def _state_backup(self) -> tuple:
+        """Deep snapshot of every mutable structure a batch can touch."""
+        return (
+            self.watermark,
+            self.max_event_timestamp,
+            copy.deepcopy(self._windows),
+            copy.deepcopy(self._finalized),
+            set(self._finalized_starts),
+            copy.deepcopy(self._dedup),
+            copy.deepcopy(self._joined_windows),
+            copy.deepcopy(self._joined_finalized),
+            self._latest_seq,
+            copy.deepcopy(self._changes),
+        )
+
+    def _state_restore(self, backup: tuple) -> None:
+        (
+            self.watermark,
+            self.max_event_timestamp,
+            self._windows,
+            self._finalized,
+            self._finalized_starts,
+            self._dedup,
+            self._joined_windows,
+            self._joined_finalized,
+            self._latest_seq,
+            self._changes,
+        ) = backup
 
     def _resolve_label(self, label_of, lookup_key: str | None):
         """Read the current label for a joined event, or None on plain streams."""
@@ -542,6 +655,12 @@ class _Stream:
             entry["change_retention"] = self.change_retention
             entry["latest_seq"] = self._latest_seq
             entry["changes"] = [dict(record) for record in self._changes]
+        if self.batch_retention is not None:
+            # Batch-enabled streams publish the config plus the retained
+            # batch records in commit order; only format_version 4
+            # documents may carry these.
+            entry["batch_retention"] = self.batch_retention
+            entry["batches"] = copy.deepcopy(self._batches)
         return entry
 
     @classmethod
@@ -550,6 +669,7 @@ class _Stream:
         data: object,
         table_names: set[str] | None = None,
         allow_change_feed: bool = False,
+        allow_batches: bool = False,
     ) -> "_Stream":
         """Rebuild one stream from a snapshot entry or raise SnapshotError.
 
@@ -560,6 +680,8 @@ class _Stream:
         document); the referenced table must be one of them. Change-feed
         fields (``change_retention``, ``latest_seq``, ``changes``) are
         only accepted when ``allow_change_feed`` is set (a version 3
+        document). Batch fields (``batch_retention``, ``batches``) are
+        only accepted when ``allow_batches`` is set (a version 4
         document).
         """
         if not isinstance(data, dict):
@@ -581,6 +703,8 @@ class _Stream:
             allowed |= {"lookup_table", "joined_windows", "joined_finalized"}
         if allow_change_feed:
             allowed |= {"change_retention", "latest_seq", "changes"}
+        if allow_batches:
+            allowed |= {"batch_retention", "batches"}
         extra = sorted(set(data) - allowed)
         if extra:
             raise SnapshotError(f"stream entry has unexpected field: {extra[0]}")
@@ -710,6 +834,21 @@ class _Stream:
                 f"stream {name!r}: latest_seq must be a non-negative integer"
             )
 
+        # The batch pair must appear together; a document without it
+        # restores as a stream without batch ingestion.
+        batch_retention = data.get("batch_retention")
+        if "batch_retention" in data:
+            if not _is_int(batch_retention) or batch_retention <= 0:
+                raise SnapshotError(
+                    f"stream {name!r}: batch_retention must be a positive integer"
+                )
+            if "batches" not in data:
+                raise SnapshotError("stream entry missing required field: batches")
+        elif "batches" in data:
+            raise SnapshotError(
+                f"stream {name!r}: batches present without batch_retention"
+            )
+
         stream = cls(
             name,
             window_ms,
@@ -719,6 +858,7 @@ class _Stream:
             slide_ms,
             lookup_table,
             change_retention,
+            batch_retention,
         )
         stream.watermark = watermark
         stream.max_event_timestamp = max_event_timestamp
@@ -783,6 +923,9 @@ class _Stream:
 
         if change_retention is not None:
             stream._load_change_records(data["changes"], latest_seq)
+
+        if batch_retention is not None:
+            stream._load_batch_records(data["batches"])
 
         if auto_lag is not None and max_event_timestamp is None:
             # No accepted event has ever happened, so no window can carry
@@ -1300,6 +1443,240 @@ class _Stream:
         self._changes = parsed
         self._latest_seq = latest_seq
 
+    def _load_batch_records(self, records: object) -> None:
+        """Load retained batch records under strict validation.
+
+        The records are kept in commit order with unique identifiers and
+        at most ``batch_retention`` of them; every request and response
+        must match the shapes the batch entry point produces on this
+        stream (event fields follow the stream's dedup/join features,
+        outcomes follow its dedup/automatic features).
+        """
+        assert self.batch_retention is not None
+        if not isinstance(records, list):
+            raise SnapshotError(f"stream {self.name!r}: batches must be an array")
+        if len(records) > self.batch_retention:
+            raise SnapshotError(
+                f"stream {self.name!r}: batches exceed batch_retention "
+                f"{self.batch_retention}"
+            )
+        seen: set[str] = set()
+        parsed: list[dict] = []
+        for raw in records:
+            if not isinstance(raw, dict):
+                raise SnapshotError(
+                    f"stream {self.name!r}: batches entries must be objects"
+                )
+            fields = {"batch_id", "request", "response"}
+            extra = sorted(set(raw) - fields)
+            if extra:
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch record has unexpected field: "
+                    f"{extra[0]}"
+                )
+            missing = sorted(fields - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch record missing field: "
+                    f"{missing[0]}"
+                )
+            batch_id = raw["batch_id"]
+            if not isinstance(batch_id, str) or not batch_id:
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch_id must be a non-empty string"
+                )
+            if batch_id in seen:
+                raise SnapshotError(
+                    f"stream {self.name!r}: duplicate batch_id {batch_id!r}"
+                )
+            seen.add(batch_id)
+            request = self._parse_batch_request(raw["request"], batch_id)
+            response = self._parse_batch_response(
+                raw["response"], batch_id, len(request["events"])
+            )
+            parsed.append(
+                {"batch_id": batch_id, "request": request, "response": response}
+            )
+        self._batches = parsed
+
+    def _parse_batch_request(self, raw: object, batch_id: str) -> dict:
+        if not isinstance(raw, dict):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch request must be an object"
+            )
+        fields = {"batch_id", "events"}
+        extra = sorted(set(raw) - fields)
+        if extra:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch request has unexpected field: "
+                f"{extra[0]}"
+            )
+        missing = sorted(fields - set(raw))
+        if missing:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch request missing field: {missing[0]}"
+            )
+        if raw["batch_id"] != batch_id:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch request batch_id does not match "
+                f"the record"
+            )
+        events = raw["events"]
+        if not isinstance(events, list) or not 1 <= len(events) <= 1000:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch events must be an array of "
+                f"1 to 1000 elements"
+            )
+        return {
+            "batch_id": batch_id,
+            "events": [self._parse_batch_event(event) for event in events],
+        }
+
+    def _parse_batch_event(self, raw: object) -> dict:
+        if not isinstance(raw, dict):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch events entries must be objects"
+            )
+        fields = {"timestamp_ms", "value"}
+        if self.dedup_retention_ms is not None:
+            fields |= {"event_id"}
+        if self.lookup_table is not None:
+            fields |= {"lookup_key"}
+        extra = sorted(set(raw) - fields)
+        if extra:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch event has unexpected field: "
+                f"{extra[0]}"
+            )
+        missing = sorted(fields - set(raw))
+        if missing:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch event missing field: {missing[0]}"
+            )
+        if not _is_int(raw["timestamp_ms"]):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch event timestamp_ms must be an integer"
+            )
+        if not _is_finite_number(raw["value"]):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch event value must be a finite number"
+            )
+        event = {"timestamp_ms": raw["timestamp_ms"], "value": raw["value"]}
+        if self.dedup_retention_ms is not None:
+            if not isinstance(raw["event_id"], str) or not raw["event_id"]:
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch event event_id must be a "
+                    f"non-empty string"
+                )
+            event["event_id"] = raw["event_id"]
+        if self.lookup_table is not None:
+            if not isinstance(raw["lookup_key"], str) or not raw["lookup_key"]:
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch event lookup_key must be a "
+                    f"non-empty string"
+                )
+            event["lookup_key"] = raw["lookup_key"]
+        return event
+
+    def _parse_batch_response(
+        self, raw: object, batch_id: str, event_count: int
+    ) -> dict:
+        if not isinstance(raw, dict):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch response must be an object"
+            )
+        fields = {"stream", "batch_id", "outcomes"}
+        extra = sorted(set(raw) - fields)
+        if extra:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch response has unexpected field: "
+                f"{extra[0]}"
+            )
+        missing = sorted(fields - set(raw))
+        if missing:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch response missing field: {missing[0]}"
+            )
+        if raw["stream"] != self.name:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch response labels stream "
+                f"{raw['stream']!r}"
+            )
+        if raw["batch_id"] != batch_id:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch response batch_id does not match "
+                f"the record"
+            )
+        outcomes = raw["outcomes"]
+        if not isinstance(outcomes, list) or len(outcomes) != event_count:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch response outcomes must be an "
+                f"array matching the events"
+            )
+        return {
+            "stream": self.name,
+            "batch_id": batch_id,
+            "outcomes": [self._parse_batch_outcome(row) for row in outcomes],
+        }
+
+    def _parse_batch_outcome(self, raw: object) -> dict:
+        if not isinstance(raw, dict):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch outcome must be an object"
+            )
+        fields = {"dropped"}
+        if self.dedup_retention_ms is not None:
+            fields |= {"duplicate"}
+        if self.auto_watermark_lag_ms is not None:
+            fields |= {"watermark_ms", "finalized"}
+        extra = sorted(set(raw) - fields)
+        if extra:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch outcome has unexpected field: "
+                f"{extra[0]}"
+            )
+        missing = sorted(fields - set(raw))
+        if missing:
+            raise SnapshotError(
+                f"stream {self.name!r}: batch outcome missing field: {missing[0]}"
+            )
+        if not isinstance(raw["dropped"], bool):
+            raise SnapshotError(
+                f"stream {self.name!r}: batch outcome dropped must be a boolean"
+            )
+        outcome = {"dropped": raw["dropped"]}
+        if self.dedup_retention_ms is not None:
+            if not isinstance(raw["duplicate"], bool):
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch outcome duplicate must be a "
+                    f"boolean"
+                )
+            outcome["duplicate"] = raw["duplicate"]
+        if self.auto_watermark_lag_ms is not None:
+            watermark = raw["watermark_ms"]
+            if watermark is not None and not _is_int(watermark):
+                raise SnapshotError(
+                    f"stream {self.name!r}: batch outcome watermark_ms must be "
+                    f"an integer or null"
+                )
+            rows = self._parse_window_list(
+                raw["finalized"],
+                self.name,
+                self.window_ms,
+                "batch outcome finalized",
+                with_stream=True,
+                step_ms=self._step_ms,
+            )
+            for row in rows:
+                if row["stream"] != self.name:
+                    raise SnapshotError(
+                        f"stream {self.name!r}: batch outcome finalized row "
+                        f"labels stream {row['stream']!r}"
+                    )
+            outcome["watermark_ms"] = watermark
+            outcome["finalized"] = [dict(row) for row in rows]
+        return outcome
+
 
 class Service:
     """StreamMill service: health reporting plus windowed event aggregation."""
@@ -1342,6 +1719,7 @@ class Service:
         slide_ms: int | None = None,
         lookup_table: str | None = None,
         change_retention: int | None = None,
+        batch_retention: int | None = None,
     ) -> dict:
         with self._lock:
             if name in self._streams:
@@ -1357,6 +1735,7 @@ class Service:
                 slide_ms,
                 lookup_table,
                 change_retention,
+                batch_retention,
             )
         payload = {
             "stream": name,
@@ -1373,6 +1752,8 @@ class Service:
             payload["lookup_table"] = lookup_table
         if change_retention is not None:
             payload["change_retention"] = change_retention
+        if batch_retention is not None:
+            payload["batch_retention"] = batch_retention
         return payload
 
     def stream_features(self, name: str) -> dict | None:
@@ -1396,20 +1777,63 @@ class Service:
     ) -> dict:
         with self._lock:
             stream = self._get(name)
-            label_of = None
-            if stream.lookup_table is not None:
-                rows = self._tables[stream.lookup_table]
-
-                def label_of(key: str, _rows=rows) -> str:
-                    try:
-                        return _rows[key]
-                    except KeyError:
-                        raise LookupKeyNotFoundError(key) from None
-
             outcome = stream.add_event(
-                timestamp_ms, value, event_id, lookup_key, label_of
+                timestamp_ms, value, event_id, lookup_key, self._label_of(stream)
             )
         return {"stream": name, **outcome}
+
+    def add_batch(self, name: str, batch_id: str, events: list[dict]) -> dict:
+        """Apply one atomic batch of events to a batch-enabled stream.
+
+        The whole call runs under the service lock, so no other request
+        can observe an intermediate state. A retained record with the
+        same ``batch_id`` and an identical request (same field values in
+        the same event order) replays its stored response without
+        writing again; the same id with different content raises
+        BatchIdConflictError. A processing failure rolls the whole batch
+        back and occupies no identifier. Only successful batches are
+        remembered, capped at the stream's ``batch_retention`` newest
+        records; replaying never refreshes that order.
+        """
+        with self._lock:
+            stream = self._get(name)
+            if stream.batch_retention is None:
+                raise BatchIngestNotEnabledError(name)
+            for record in stream._batches:
+                if record["batch_id"] == batch_id:
+                    if record["request"]["events"] == events:
+                        return copy.deepcopy(record["response"])
+                    raise BatchIdConflictError(batch_id)
+            outcomes = stream.apply_batch(events, self._label_of(stream))
+            response = {"stream": name, "batch_id": batch_id, "outcomes": outcomes}
+            stream._batches.append(
+                {
+                    "batch_id": batch_id,
+                    "request": {
+                        "batch_id": batch_id,
+                        "events": copy.deepcopy(events),
+                    },
+                    "response": copy.deepcopy(response),
+                }
+            )
+            overflow = len(stream._batches) - stream.batch_retention
+            if overflow > 0:
+                del stream._batches[:overflow]
+            return response
+
+    def _label_of(self, stream: _Stream):
+        """Current-label reader for a joined stream, else None."""
+        if stream.lookup_table is None:
+            return None
+        rows = self._tables[stream.lookup_table]
+
+        def label_of(key: str, _rows=rows) -> str:
+            try:
+                return _rows[key]
+            except KeyError:
+                raise LookupKeyNotFoundError(key) from None
+
+        return label_of
 
     def advance_watermark(self, name: str, watermark_ms: int) -> dict:
         with self._lock:
@@ -1468,11 +1892,12 @@ class Service:
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
         included or fully excluded. Instances with at least one
-        change-feed stream export ``format_version`` 3 (always carrying
-        the ``tables`` array plus the change-feed state on enabled
-        streams); otherwise instances with dimension tables export
-        ``format_version`` 2, and without any join or change-feed state
-        the document is the unchanged version 1 shape.
+        batch-enabled stream export ``format_version`` 4 (always carrying
+        the ``tables`` array plus the batch state on enabled streams);
+        otherwise instances with at least one change-feed stream export
+        ``format_version`` 3, instances with dimension tables export
+        ``format_version`` 2, and without any join, change-feed or batch
+        state the document is the unchanged version 1 shape.
         """
         with self._lock:
             streams = [
@@ -1488,6 +1913,16 @@ class Service:
                 }
                 for table in sorted(self._tables)
             ]
+            batches = any(
+                stream.batch_retention is not None
+                for stream in self._streams.values()
+            )
+            if batches:
+                return {
+                    "format_version": SNAPSHOT_FORMAT_VERSION_BATCHES,
+                    "tables": tables,
+                    "streams": streams,
+                }
             change_feed = any(
                 stream.change_retention is not None
                 for stream in self._streams.values()
@@ -1519,8 +1954,11 @@ class Service:
         version 2 documents additionally restore dimension tables and
         joined-stream state under strict validation; version 3 documents
         additionally restore change-feed state (retention, cursor and
-        retained records) under strict validation. Returns the restored
-        stream count.
+        retained records) under strict validation; version 4 documents
+        additionally restore batch-ingest state (retention and the
+        retained batch records, so replay and eviction continue exactly
+        as on the uninterrupted instance). Returns the restored stream
+        count.
         """
         with self._lock:
             # Conflict takes priority over every content check: an instance
@@ -1544,6 +1982,7 @@ class Service:
             elif version in (
                 SNAPSHOT_FORMAT_VERSION_JOIN,
                 SNAPSHOT_FORMAT_VERSION_CHANGES,
+                SNAPSHOT_FORMAT_VERSION_BATCHES,
             ):
                 allowed = {"format_version", "streams", "tables"}
             else:
@@ -1566,6 +2005,7 @@ class Service:
             if version in (
                 SNAPSHOT_FORMAT_VERSION_JOIN,
                 SNAPSHOT_FORMAT_VERSION_CHANGES,
+                SNAPSHOT_FORMAT_VERSION_BATCHES,
             ):
                 tables = self._parse_tables(document["tables"])
 
@@ -1579,9 +2019,18 @@ class Service:
                     entry,
                     table_names=set(tables)
                     if version
-                    in (SNAPSHOT_FORMAT_VERSION_JOIN, SNAPSHOT_FORMAT_VERSION_CHANGES)
+                    in (
+                        SNAPSHOT_FORMAT_VERSION_JOIN,
+                        SNAPSHOT_FORMAT_VERSION_CHANGES,
+                        SNAPSHOT_FORMAT_VERSION_BATCHES,
+                    )
                     else None,
-                    allow_change_feed=version == SNAPSHOT_FORMAT_VERSION_CHANGES,
+                    allow_change_feed=version
+                    in (
+                        SNAPSHOT_FORMAT_VERSION_CHANGES,
+                        SNAPSHOT_FORMAT_VERSION_BATCHES,
+                    ),
+                    allow_batches=version == SNAPSHOT_FORMAT_VERSION_BATCHES,
                 )
                 if stream.name in restored:
                     raise SnapshotError(

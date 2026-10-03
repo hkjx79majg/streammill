@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .service import (
+    BatchIdConflictError,
+    BatchIngestNotEnabledError,
     ChangeCursorAheadError,
     ChangeCursorExpiredError,
     ChangeFeedNotEnabledError,
@@ -72,6 +74,7 @@ _CREATE_OPTIONAL_FIELDS = {
     "slide_ms": lambda v: _is_int(v) and v > 0,
     "lookup_table": lambda v: isinstance(v, str) and len(v) > 0,
     "change_retention": lambda v: _is_int(v) and v > 0,
+    "batch_retention": lambda v: _is_int(v) and v > 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -92,6 +95,10 @@ _ROW_FIELDS = {
 }
 _WATERMARK_FIELDS = {
     "watermark_ms": _is_int,
+}
+_BATCH_FIELDS = {
+    "batch_id": lambda v: isinstance(v, str) and len(v) > 0,
+    "events": lambda v: isinstance(v, list) and 1 <= len(v) <= 1000,
 }
 
 
@@ -194,6 +201,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(segments) == 3 and segments[0] == "streams" and segments[2] == "events":
                 self._add_event(segments[1])
                 return
+            if len(segments) == 3 and segments[0] == "streams" and segments[2] == "batches":
+                self._add_batch(segments[1])
+                return
             if len(segments) == 3 and segments[0] == "streams" and segments[2] == "watermark":
                 self._advance_watermark(segments[1])
                 return
@@ -229,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
                 slide,
                 values.get("lookup_table"),
                 values.get("change_retention"),
+                values.get("batch_retention"),
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
@@ -284,6 +295,42 @@ class Handler(BaseHTTPRequestHandler):
         except LookupKeyNotFoundError:
             raise _RequestError(
                 409, "lookup_key_not_found", f"unknown lookup_key: {values['lookup_key']}"
+            ) from None
+        self.send_json(200, payload)
+
+    def _add_batch(self, name: str) -> None:
+        values = _validate(self._read_json(), _BATCH_FIELDS)
+        features = self.service.stream_features(name)
+        fields = dict(_EVENT_FIELDS)
+        if features is not None:
+            if features["dedup"]:
+                fields.update(_EVENT_DEDUP_FIELDS)
+            if features["join"]:
+                fields.update(_EVENT_JOIN_FIELDS)
+        # Every element is validated before anything is applied, so a
+        # structural failure anywhere rejects the whole batch. Unknown
+        # streams validate against the base shape, matching the single
+        # event route's 422-before-404 ordering.
+        events = [_validate(raw, fields) for raw in values["events"]]
+        try:
+            payload = self.service.add_batch(name, values["batch_id"], events)
+        except StreamNotFoundError:
+            raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        except BatchIngestNotEnabledError:
+            raise _RequestError(
+                409, "batch_ingest_not_enabled", f"stream has no batch ingest: {name}"
+            ) from None
+        except BatchIdConflictError:
+            raise _RequestError(
+                409, "batch_id_conflict", f"conflicting batch_id: {values['batch_id']}"
+            ) from None
+        except EventIdConflictError as exc:
+            raise _RequestError(
+                409, "event_id_conflict", f"conflicting event_id: {exc}"
+            ) from None
+        except LookupKeyNotFoundError as exc:
+            raise _RequestError(
+                409, "lookup_key_not_found", f"unknown lookup_key: {exc}"
             ) from None
         self.send_json(200, payload)
 
