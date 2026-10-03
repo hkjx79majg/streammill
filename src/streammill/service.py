@@ -48,14 +48,30 @@ regress below a manual watermark. Event responses on automatic streams
 additionally carry the post-processing ``watermark_ms`` (``null`` until a
 watermark exists) and the windows finalized by that response.
 
+Streams may optionally slide by passing a positive ``slide_ms`` at
+creation time (no larger than ``window_ms`` and dividing it evenly). On
+such streams every accepted event is aggregated into every window whose
+start is a multiple of ``slide_ms`` and satisfies
+``start <= timestamp_ms < start + window_ms`` (negative timestamps
+follow the same arithmetic), so consecutive windows of width
+``window_ms`` overlap by ``window_ms - slide_ms``. Finalization still
+happens per window once the watermark reaches
+``window_end_ms + allowed_lateness_ms`` and each window is emitted
+exactly once, ordered by ``window_start_ms``. Lateness, deduplication
+and automatic-watermark rules are unchanged: they act on the event as a
+whole, never on individual window memberships. Streams without
+``slide_ms`` keep the exact tumbling behaviour and document shape.
+
 A portable full-state snapshot is available through
 ``Service.snapshot`` / ``Service.restore_snapshot``: export produces a
 self-contained JSON document (``format_version`` 1) capturing config,
 watermark, open windows, finalized results and retained dedup records;
 automatic streams additionally carry ``auto_watermark_lag_ms`` and
-``max_event_timestamp_ms``. Restore is only accepted on an instance
-without any streams, validates the document strictly (never silently
-repairing it) and publishes the whole state atomically.
+``max_event_timestamp_ms``; sliding streams additionally carry
+``slide_ms`` (documents without it restore as tumbling streams). Restore
+is only accepted on an instance without streams, validates the document
+strictly (never silently repairing it) and publishes the whole state
+atomically.
 
 Joins and disk persistence remain out of scope.
 """
@@ -116,12 +132,14 @@ class _Stream:
         allowed_lateness_ms: int,
         dedup_retention_ms: int | None = None,
         auto_watermark_lag_ms: int | None = None,
+        slide_ms: int | None = None,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
         self.allowed_lateness_ms = allowed_lateness_ms
         self.dedup_retention_ms = dedup_retention_ms
         self.auto_watermark_lag_ms = auto_watermark_lag_ms
+        self.slide_ms = slide_ms
         self.watermark: int | None = None
         # Maximum timestamp_ms of a successfully accepted event; only
         # maintained on automatic streams, None until the first such event.
@@ -198,11 +216,28 @@ class _Stream:
             return self.advance_watermark(target)
         return []
 
+    def _covering_starts(self, timestamp_ms: int) -> list[int]:
+        """Window starts (ascending) that an event at timestamp_ms joins.
+
+        Tumbling streams produce the single left-closed, right-open
+        bucket; sliding streams produce every start that is a multiple of
+        ``slide_ms`` with ``start <= timestamp_ms < start + window_ms``.
+        Floor/ceil division keeps the same boundaries for negative
+        timestamps.
+        """
+        if self.slide_ms is None:
+            return [(timestamp_ms // self.window_ms) * self.window_ms]
+        step = self.slide_ms
+        # Smallest multiple of step strictly above timestamp_ms - window_ms.
+        lo = -((self.window_ms - 1 - timestamp_ms) // step) * step
+        hi = (timestamp_ms // step) * step
+        return list(range(lo, hi + 1, step))
+
     def _aggregate(self, timestamp_ms: int, value: float) -> None:
-        start = (timestamp_ms // self.window_ms) * self.window_ms
-        bucket = self._windows.setdefault(start, [0, 0])
-        bucket[0] += 1
-        bucket[1] += value
+        for start in self._covering_starts(timestamp_ms):
+            bucket = self._windows.setdefault(start, [0, 0])
+            bucket[0] += 1
+            bucket[1] += value
 
     def advance_watermark(self, watermark_ms: int) -> list[dict]:
         if self.watermark is not None and watermark_ms < self.watermark:
@@ -263,6 +298,10 @@ class _Stream:
                 key=lambda row: row["window_start_ms"],
             ),
         }
+        if self.slide_ms is not None:
+            # Sliding streams publish the step; tumbling streams keep the
+            # historical document shape exactly.
+            entry["slide_ms"] = self.slide_ms
         if self.auto_watermark_lag_ms is not None:
             # Automatic streams publish the pair together; manual streams
             # keep the historical document shape exactly.
@@ -295,6 +334,7 @@ class _Stream:
             "dedup_records",
             "auto_watermark_lag_ms",
             "max_event_timestamp_ms",
+            "slide_ms",
         }
         extra = sorted(set(data) - allowed)
         if extra:
@@ -342,6 +382,20 @@ class _Stream:
         window_ms = data.get("window_ms")
         if not _is_int(window_ms) or window_ms <= 0:
             raise SnapshotError(f"stream {name!r}: window_ms must be a positive integer")
+        slide_ms = data.get("slide_ms")
+        if slide_ms is not None:
+            if not _is_int(slide_ms) or slide_ms <= 0:
+                raise SnapshotError(
+                    f"stream {name!r}: slide_ms must be a positive integer"
+                )
+            if slide_ms > window_ms:
+                raise SnapshotError(
+                    f"stream {name!r}: slide_ms must not exceed window_ms"
+                )
+            if window_ms % slide_ms != 0:
+                raise SnapshotError(
+                    f"stream {name!r}: slide_ms must divide window_ms evenly"
+                )
         allowed_lateness_ms = data.get("allowed_lateness_ms")
         if not _is_int(allowed_lateness_ms) or allowed_lateness_ms < 0:
             raise SnapshotError(
@@ -365,7 +419,7 @@ class _Stream:
                 f"non-null watermark"
             )
 
-        stream = cls(name, window_ms, allowed_lateness_ms, retention, auto_lag)
+        stream = cls(name, window_ms, allowed_lateness_ms, retention, auto_lag, slide_ms)
         stream.watermark = watermark
         stream.max_event_timestamp = max_event_timestamp
 
@@ -375,6 +429,7 @@ class _Stream:
             window_ms,
             "finalized",
             with_stream=True,
+            align_ms=slide_ms if slide_ms is not None else window_ms,
         )
         if finalized_rows and watermark is None:
             raise SnapshotError(
@@ -400,6 +455,7 @@ class _Stream:
             window_ms,
             "windows",
             with_stream=False,
+            align_ms=slide_ms if slide_ms is not None else window_ms,
         )
         for row in open_rows:
             start = row["window_start_ms"]
@@ -432,11 +488,13 @@ class _Stream:
                 )
         if auto_lag is not None and max_event_timestamp is not None:
             # The remembered maximum must be backed by an accepted event, so
-            # its window has to be one of the open or finalized windows.
-            max_bucket = (max_event_timestamp // window_ms) * window_ms
-            if (
-                max_bucket not in stream._windows
-                and max_bucket not in stream._finalized_starts
+            # every window that event belongs to has to be one of the open
+            # or finalized windows.
+            max_buckets = stream._covering_starts(max_event_timestamp)
+            if any(
+                bucket not in stream._windows
+                and bucket not in stream._finalized_starts
+                for bucket in max_buckets
             ):
                 raise SnapshotError(
                     f"stream {name!r}: max_event_timestamp_ms {max_event_timestamp} "
@@ -460,6 +518,7 @@ class _Stream:
         where: str,
         *,
         with_stream: bool,
+        align_ms: int,
     ) -> list[dict]:
         if not isinstance(value, list):
             raise SnapshotError(f"stream {name!r}: {where} must be an array")
@@ -491,9 +550,9 @@ class _Stream:
                 raise SnapshotError(
                     f"stream {name!r}: {where} window_start_ms must be an integer"
                 )
-            if start % window_ms != 0:
+            if start % align_ms != 0:
                 raise SnapshotError(
-                    f"stream {name!r}: window {start} is not aligned to window_ms {window_ms}"
+                    f"stream {name!r}: window {start} is not aligned to step {align_ms}"
                 )
             if not _is_int(end) or end != start + window_ms:
                 raise SnapshotError(
@@ -572,13 +631,13 @@ class _Stream:
                     f"stream {self.name!r}: dedup record {event_id!r} is past the "
                     f"retention horizon and must have been evicted"
                 )
-            bucket = (timestamp_ms // self.window_ms) * self.window_ms
-            if bucket not in buckets:
-                raise SnapshotError(
-                    f"stream {self.name!r}: dedup record {event_id!r} aggregates into "
-                    f"unknown window {bucket}"
-                )
-            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+            for bucket in self._covering_starts(timestamp_ms):
+                if bucket not in buckets:
+                    raise SnapshotError(
+                        f"stream {self.name!r}: dedup record {event_id!r} aggregates into "
+                        f"unknown window {bucket}"
+                    )
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
             self._dedup[event_id] = (timestamp_ms, value)
         for bucket, retained in bucket_counts.items():
             total = self._windows[bucket][0] if bucket in self._windows else next(
@@ -611,6 +670,7 @@ class Service:
         allowed_lateness_ms: int,
         dedup_retention_ms: int | None = None,
         auto_watermark_lag_ms: int | None = None,
+        slide_ms: int | None = None,
     ) -> dict:
         with self._lock:
             if name in self._streams:
@@ -621,6 +681,7 @@ class Service:
                 allowed_lateness_ms,
                 dedup_retention_ms,
                 auto_watermark_lag_ms,
+                slide_ms,
             )
         payload = {
             "stream": name,
@@ -631,6 +692,8 @@ class Service:
             payload["dedup_retention_ms"] = dedup_retention_ms
         if auto_watermark_lag_ms is not None:
             payload["auto_watermark_lag_ms"] = auto_watermark_lag_ms
+        if slide_ms is not None:
+            payload["slide_ms"] = slide_ms
         return payload
 
     def dedup_enabled(self, name: str) -> bool | None:

@@ -62,6 +62,7 @@ _CREATE_FIELDS = {
 _CREATE_OPTIONAL_FIELDS = {
     "dedup_retention_ms": lambda v: _is_int(v) and v > 0,
     "auto_watermark_lag_ms": lambda v: _is_int(v) and v >= 0,
+    "slide_ms": lambda v: _is_int(v) and v > 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -172,6 +173,12 @@ class Handler(BaseHTTPRequestHandler):
             raise _invalid_request(
                 "dedup_retention_ms must be at least allowed_lateness_ms"
             )
+        slide = values.get("slide_ms")
+        if slide is not None:
+            if slide > values["window_ms"]:
+                raise _invalid_request("slide_ms must not exceed window_ms")
+            if values["window_ms"] % slide != 0:
+                raise _invalid_request("slide_ms must divide window_ms evenly")
         try:
             payload = self.service.create_stream(
                 values["name"],
@@ -179,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
                 values["allowed_lateness_ms"],
                 retention,
                 values.get("auto_watermark_lag_ms"),
+                slide,
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
