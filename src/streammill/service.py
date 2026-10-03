@@ -170,11 +170,47 @@ the stream's features) and publishes them so replay and eviction behave
 exactly as on the uninterrupted instance. Older document versions
 restore as before.
 
+Dimension tables may instead be created as event-time versioned
+(``event_time_versioned``). Such a table keeps, per key, a sorted map of
+versions ``effective_from_ms -> label``; a version is valid from its
+effective time until the next version of the same key, and versions may
+arrive out of order. Rows are written through the same entry point with
+an additional integer ``effective_from_ms``:
+
+* the first write of a key, or a brand-new effective time, reports
+  ``changed: true``;
+* resubmitting the exact same ``(key, effective_from_ms, label)`` triple
+  reports ``changed: false``;
+* the same key and effective time with a different label is rejected
+  with ``dimension_version_conflict`` and leaves history untouched.
+
+A joined stream referencing a versioned table resolves every event at
+its own ``timestamp_ms``: the newest version whose ``effective_from_ms``
+is not greater than the event time supplies the label, after which the
+existing window and per-group aggregation runs unchanged. An unknown
+key, or an event time before the key's first version, is rejected with
+``lookup_version_not_found`` and leaves every state (aggregates, dedup,
+watermark, batches and change sequence) untouched; later backfills of
+dimension history never recompute already accepted events. Batches keep
+rolling back as a whole when any element misses a version. Plain tables
+and every other surface are unchanged.
+
+Instances with at least one versioned table export snapshots as
+``format_version`` 5: every table object records its mode
+(``event_time_versioned: true`` on versioned tables) and a versioned
+table's rows are ``{key, label, effective_from_ms}`` triples in strict
+ascending ``(key, effective_from_ms)`` order. Restore stays compatible
+with versions 1 through 4 and strictly rejects wrong mode/field
+combinations, duplicate or out-of-order versions, invalid effective
+times and conflicts at the same effective time as
+``invalid_snapshot`` without publishing partial state.
+
 Disk persistence remains out of scope.
 """
 
 from __future__ import annotations
 
+import bisect
 import copy
 import math
 import threading
@@ -185,6 +221,7 @@ SNAPSHOT_FORMAT_VERSION = 1
 SNAPSHOT_FORMAT_VERSION_JOIN = 2
 SNAPSHOT_FORMAT_VERSION_CHANGES = 3
 SNAPSHOT_FORMAT_VERSION_BATCHES = 4
+SNAPSHOT_FORMAT_VERSION_VERSIONS = 5
 
 
 class StreamExistsError(Exception):
@@ -205,6 +242,14 @@ class TableNotFoundError(Exception):
 
 class LookupKeyNotFoundError(Exception):
     """Raised when an event's lookup_key has no row in the table."""
+
+
+class DimensionVersionConflictError(Exception):
+    """Raised when a version point already exists with a different label."""
+
+
+class LookupVersionNotFoundError(Exception):
+    """Raised when no dimension version is valid at an event's timestamp."""
 
 
 class JoinNotEnabledError(Exception):
@@ -257,6 +302,77 @@ def _is_finite_number(value: object) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(value)
     )
+
+
+class _Table:
+    """In-process dimension table state. Guarded by the Service lock.
+
+    A plain table is the current-value map ``key -> label`` and a row
+    write replaces the label. A versioned table instead keeps, per key,
+    a sorted map ``effective_from_ms -> label``: each version is valid
+    from its effective time until the next version of that key, and
+    versions may be inserted out of order. The internal structure of the
+    two modes is intentionally distinct.
+    """
+
+    def __init__(self, name: str, event_time_versioned: bool = False) -> None:
+        self.name = name
+        self.event_time_versioned = event_time_versioned
+        if event_time_versioned:
+            # key -> {effective_from_ms: label}, sorted maps.
+            self.versions: dict[str, dict[int, str]] = {}
+        else:
+            self.rows: dict[str, str] = {}
+
+    def put_row(
+        self, key: str, label: str, effective_from_ms: int | None = None
+    ) -> bool:
+        """Upsert one row; return whether the stored state actually changed.
+
+        Plain tables overwrite the current label. On versioned tables an
+        exact retry of an existing ``(effective_from_ms, label)`` pair is
+        a no change, while the same effective time with a different
+        label raises DimensionVersionConflictError without touching
+        history; inserting a new effective time (in any order) changes.
+        """
+        if not self.event_time_versioned:
+            changed = self.rows.get(key) != label
+            self.rows[key] = label
+            return changed
+        assert effective_from_ms is not None
+        versions = self.versions.setdefault(key, {})
+        existing = versions.get(effective_from_ms)
+        if existing is not None:
+            if existing != label:
+                raise DimensionVersionConflictError(
+                    f"table {self.name!r}: key {key!r} already has a version "
+                    f"at {effective_from_ms}"
+                )
+            return False
+        versions[effective_from_ms] = label
+        return True
+
+    def label_at(self, key: str, timestamp_ms: int) -> str:
+        """Return the label valid at ``timestamp_ms`` for a versioned table.
+
+        Selects the newest version of ``key`` whose effective time is not
+        greater than the event time. An unknown key or an event time
+        before the first version raises LookupVersionNotFoundError.
+        """
+        versions = self.versions.get(key)
+        if not versions:
+            raise LookupVersionNotFoundError(
+                f"table {self.name!r}: no version of key {key!r} is valid "
+                f"at {timestamp_ms}"
+            )
+        starts = sorted(versions)
+        index = bisect.bisect_right(starts, timestamp_ms) - 1
+        if index < 0:
+            raise LookupVersionNotFoundError(
+                f"table {self.name!r}: key {key!r} has no version valid at "
+                f"{timestamp_ms}"
+            )
+        return versions[starts[index]]
 
 
 class _Stream:
@@ -350,12 +466,14 @@ class _Stream:
         the resulting monotone watermark advance) only runs after
         aggregation and dedup registration.
 
-        On joined streams the current label for ``lookup_key`` is read
-        through ``label_of`` after the dedup and lateness decisions but
-        before any state mutation, so an unknown key raises
-        LookupKeyNotFoundError with all state untouched. The dedup check
-        includes the lookup key: an exact retry repeats timestamp, value
-        and key, while the same id with a different key conflicts.
+        On joined streams the label for ``lookup_key`` is read through
+        ``label_of`` after the dedup and lateness decisions but before
+        any state mutation, so an unknown key (or, against a versioned
+        table, an event time without a valid version) raises
+        LookupKeyNotFoundError/LookupVersionNotFoundError with all state
+        untouched. The dedup check includes the lookup key: an exact
+        retry repeats timestamp, value and key, while the same id with a
+        different key conflicts.
         """
         automatic = self.auto_watermark_lag_ms is not None
         joined = self.lookup_table is not None
@@ -377,7 +495,7 @@ class _Stream:
                 if automatic:
                     outcome.update(watermark_ms=self.watermark, finalized=[])
                 return outcome
-            label = self._resolve_label(label_of, lookup_key)
+            label = self._resolve_label(label_of, lookup_key, timestamp_ms)
             self._aggregate(timestamp_ms, value, lookup_key, label)
             self._dedup[event_id] = (
                 (timestamp_ms, value, lookup_key)
@@ -391,7 +509,7 @@ class _Stream:
                 if automatic:
                     outcome.update(watermark_ms=self.watermark, finalized=[])
                 return outcome
-            label = self._resolve_label(label_of, lookup_key)
+            label = self._resolve_label(label_of, lookup_key, timestamp_ms)
             self._aggregate(timestamp_ms, value, lookup_key, label)
             outcome = {"dropped": False}
         if automatic:
@@ -458,11 +576,16 @@ class _Stream:
             self._changes,
         ) = backup
 
-    def _resolve_label(self, label_of, lookup_key: str | None):
-        """Read the current label for a joined event, or None on plain streams."""
+    def _resolve_label(self, label_of, lookup_key: str | None, timestamp_ms: int):
+        """Read the label for a joined event, or None on plain streams.
+
+        The reader receives both the key and the event timestamp so a
+        versioned table resolves the dimension version that was valid at
+        event time, while a current-value table ignores the timestamp.
+        """
         if self.lookup_table is None:
             return None
-        return label_of(lookup_key)
+        return label_of(lookup_key, timestamp_ms)
 
     def _is_too_late(self, timestamp_ms: int) -> bool:
         return (
@@ -1687,27 +1810,41 @@ class Service:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._streams: dict[str, _Stream] = {}
-        # table name -> {key: label}; in-process dimension tables.
-        self._tables: dict[str, dict[str, str]] = {}
+        # table name -> _Table; in-process dimension tables.
+        self._tables: dict[str, _Table] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
 
-    def create_table(self, name: str) -> dict:
+    def create_table(
+        self, name: str, event_time_versioned: bool = False
+    ) -> dict:
         with self._lock:
             if name in self._tables:
                 raise TableExistsError(name)
-            self._tables[name] = {}
-        return {"table": name}
+            self._tables[name] = _Table(name, event_time_versioned)
+        payload = {"table": name}
+        if event_time_versioned:
+            payload["event_time_versioned"] = True
+        return payload
 
-    def put_row(self, table: str, key: str, label: str) -> dict:
+    def put_row(
+        self,
+        table: str,
+        key: str,
+        label: str,
+        effective_from_ms: int | None = None,
+    ) -> dict:
         with self._lock:
-            rows = self._tables.get(table)
-            if rows is None:
+            dimension = self._tables.get(table)
+            if dimension is None:
                 raise TableNotFoundError(table)
-            changed = rows.get(key) != label
-            rows[key] = label
-        return {"table": table, "key": key, "label": label, "changed": changed}
+            changed = dimension.put_row(key, label, effective_from_ms)
+        result = {"table": table, "key": key, "label": label}
+        if dimension.event_time_versioned:
+            result["effective_from_ms"] = effective_from_ms
+        result["changed"] = changed
+        return result
 
     def create_stream(
         self,
@@ -1767,6 +1904,14 @@ class Service:
                 "join": stream.lookup_table is not None,
             }
 
+    def table_features(self, name: str) -> dict | None:
+        """Row-write features of the table; None if it is unknown."""
+        with self._lock:
+            dimension = self._tables.get(name)
+            if dimension is None:
+                return None
+            return {"event_time_versioned": dimension.event_time_versioned}
+
     def add_event(
         self,
         name: str,
@@ -1822,16 +1967,26 @@ class Service:
             return response
 
     def _label_of(self, stream: _Stream):
-        """Current-label reader for a joined stream, else None."""
+        """Label reader for a joined stream, else None.
+
+        A current-value table resolves the latest label regardless of
+        the event timestamp; a versioned table resolves the version
+        valid at the event's timestamp. The reader takes (key,
+        timestamp_ms) so both modes share one per-event call path.
+        """
         if stream.lookup_table is None:
             return None
-        rows = self._tables[stream.lookup_table]
+        dimension = self._tables[stream.lookup_table]
 
-        def label_of(key: str, _rows=rows) -> str:
-            try:
-                return _rows[key]
-            except KeyError:
-                raise LookupKeyNotFoundError(key) from None
+        if dimension.event_time_versioned:
+            def label_of(key: str, timestamp_ms: int) -> str:
+                return dimension.label_at(key, timestamp_ms)
+        else:
+            def label_of(key: str, timestamp_ms: int) -> str:
+                try:
+                    return dimension.rows[key]
+                except KeyError:
+                    raise LookupKeyNotFoundError(key) from None
 
         return label_of
 
@@ -1892,9 +2047,11 @@ class Service:
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
         included or fully excluded. Instances with at least one
-        batch-enabled stream export ``format_version`` 4 (always carrying
-        the ``tables`` array plus the batch state on enabled streams);
-        otherwise instances with at least one change-feed stream export
+        event-time versioned table export ``format_version`` 5 (the
+        table objects record their mode; version rows leave in strict
+        ``(key, effective_from_ms)`` order); otherwise instances with at
+        least one batch-enabled stream export ``format_version`` 4,
+        instances with at least one change-feed stream export
         ``format_version`` 3, instances with dimension tables export
         ``format_version`` 2, and without any join, change-feed or batch
         state the document is the unchanged version 1 shape.
@@ -1903,16 +2060,17 @@ class Service:
             streams = [
                 self._streams[name].to_snapshot() for name in sorted(self._streams)
             ]
-            tables = [
-                {
-                    "name": table,
-                    "rows": [
-                        {"key": key, "label": self._tables[table][key]}
-                        for key in sorted(self._tables[table])
-                    ],
+            tables = [self._table_to_snapshot(name) for name in sorted(self._tables)]
+            versioned = any(
+                dimension.event_time_versioned
+                for dimension in self._tables.values()
+            )
+            if versioned:
+                return {
+                    "format_version": SNAPSHOT_FORMAT_VERSION_VERSIONS,
+                    "tables": tables,
+                    "streams": streams,
                 }
-                for table in sorted(self._tables)
-            ]
             batches = any(
                 stream.batch_retention is not None
                 for stream in self._streams.values()
@@ -1944,6 +2102,39 @@ class Service:
                 "streams": streams,
             }
 
+    def _table_to_snapshot(self, name: str) -> dict:
+        """Serialize one dimension table, recording its mode.
+
+        Plain tables keep the ``rows`` array of ``{key, label}`` ordered
+        by key; versioned tables carry ``event_time_versioned: true``
+        plus ``versions`` of ``{key, label, effective_from_ms}`` in
+        strict ``(key, effective_from_ms)`` order.
+        """
+        dimension = self._tables[name]
+        if not dimension.event_time_versioned:
+            return {
+                "name": name,
+                "rows": [
+                    {"key": key, "label": dimension.rows[key]}
+                    for key in sorted(dimension.rows)
+                ],
+            }
+        rows = []
+        for key in sorted(dimension.versions):
+            for effective_from_ms in sorted(dimension.versions[key]):
+                rows.append(
+                    {
+                        "key": key,
+                        "label": dimension.versions[key][effective_from_ms],
+                        "effective_from_ms": effective_from_ms,
+                    }
+                )
+        return {
+            "name": name,
+            "event_time_versioned": True,
+            "versions": rows,
+        }
+
     def restore_snapshot(self, document: object) -> int:
         """Replace instance state with a validated snapshot, atomically.
 
@@ -1957,7 +2148,9 @@ class Service:
         retained records) under strict validation; version 4 documents
         additionally restore batch-ingest state (retention and the
         retained batch records, so replay and eviction continue exactly
-        as on the uninterrupted instance). Returns the restored stream
+        as on the uninterrupted instance); version 5 documents
+        additionally restore event-time versioned tables (mode plus
+        strictly ordered version rows). Returns the restored stream
         count.
         """
         with self._lock:
@@ -1983,6 +2176,7 @@ class Service:
                 SNAPSHOT_FORMAT_VERSION_JOIN,
                 SNAPSHOT_FORMAT_VERSION_CHANGES,
                 SNAPSHOT_FORMAT_VERSION_BATCHES,
+                SNAPSHOT_FORMAT_VERSION_VERSIONS,
             ):
                 allowed = {"format_version", "streams", "tables"}
             else:
@@ -2001,13 +2195,17 @@ class Service:
             if not isinstance(entries, list):
                 raise SnapshotError("streams must be an array")
 
-            tables: dict[str, dict[str, str]] = {}
+            tables: dict[str, _Table] = {}
             if version in (
                 SNAPSHOT_FORMAT_VERSION_JOIN,
                 SNAPSHOT_FORMAT_VERSION_CHANGES,
                 SNAPSHOT_FORMAT_VERSION_BATCHES,
+                SNAPSHOT_FORMAT_VERSION_VERSIONS,
             ):
-                tables = self._parse_tables(document["tables"])
+                tables = self._parse_tables(
+                    document["tables"],
+                    allow_versioned=version == SNAPSHOT_FORMAT_VERSION_VERSIONS,
+                )
 
             # Build and validate everything before the single publishing
             # assignment, so a failure leaves no partial state and concurrent
@@ -2023,14 +2221,20 @@ class Service:
                         SNAPSHOT_FORMAT_VERSION_JOIN,
                         SNAPSHOT_FORMAT_VERSION_CHANGES,
                         SNAPSHOT_FORMAT_VERSION_BATCHES,
+                        SNAPSHOT_FORMAT_VERSION_VERSIONS,
                     )
                     else None,
                     allow_change_feed=version
                     in (
                         SNAPSHOT_FORMAT_VERSION_CHANGES,
                         SNAPSHOT_FORMAT_VERSION_BATCHES,
+                        SNAPSHOT_FORMAT_VERSION_VERSIONS,
                     ),
-                    allow_batches=version == SNAPSHOT_FORMAT_VERSION_BATCHES,
+                    allow_batches=version
+                    in (
+                        SNAPSHOT_FORMAT_VERSION_BATCHES,
+                        SNAPSHOT_FORMAT_VERSION_VERSIONS,
+                    ),
                 )
                 if stream.name in restored:
                     raise SnapshotError(
@@ -2045,65 +2249,172 @@ class Service:
             return len(restored)
 
     @staticmethod
-    def _parse_tables(value: object) -> dict[str, dict[str, str]]:
-        """Validate the ``tables`` array of a version 2 snapshot."""
+    def _parse_tables(
+        value: object, *, allow_versioned: bool = False
+    ) -> dict[str, _Table]:
+        """Validate the ``tables`` array of a version 2+ snapshot.
+
+        Entries are strictly ordered by name and each entry's mode
+        fields must agree: a plain table is exactly
+        ``{name, rows:[{key, label}]}`` with rows strictly ordered by
+        key; a versioned table (only allowed when ``allow_versioned``)
+        is exactly ``{name, event_time_versioned: true,
+        versions:[{key, label, effective_from_ms}]}`` with version rows
+        strictly ordered by ``(key, effective_from_ms)``. Any other
+        field combination, duplicate or out-of-order key/version, or
+        invalid effective time raises SnapshotError.
+        """
         if not isinstance(value, list):
             raise SnapshotError("tables must be an array")
-        tables: dict[str, dict[str, str]] = {}
+        tables: dict[str, _Table] = {}
         previous_name: str | None = None
         for entry in value:
             if not isinstance(entry, dict):
                 raise SnapshotError("table entries must be objects")
-            extra = sorted(set(entry) - {"name", "rows"})
-            if extra:
-                raise SnapshotError(f"table entry has unexpected field: {extra[0]}")
-            missing = sorted({"name", "rows"} - set(entry))
-            if missing:
+            plain_fields = {"name", "rows"}
+            version_fields = {"name", "event_time_versioned", "versions"}
+            has_mode_field = (
+                "versions" in entry or "event_time_versioned" in entry
+            )
+            if has_mode_field and not allow_versioned:
+                # Older documents only know the {name, rows} table shape.
+                offender = "versions" if "versions" in entry else "event_time_versioned"
                 raise SnapshotError(
-                    f"table entry missing required field: {missing[0]}"
+                    f"table entry has unexpected field: {offender}"
                 )
+            if has_mode_field:
+                extra = sorted(set(entry) - version_fields)
+                if extra:
+                    raise SnapshotError(
+                        f"table entry has unexpected field: {extra[0]}"
+                    )
+                missing = sorted(version_fields - set(entry))
+                if missing:
+                    raise SnapshotError(
+                        f"table entry missing required field: {missing[0]}"
+                    )
+                if entry["event_time_versioned"] is not True:
+                    raise SnapshotError(
+                        "a versions table must carry event_time_versioned: true"
+                    )
+                raw_rows = entry["versions"]
+                if not isinstance(raw_rows, list):
+                    raise SnapshotError(
+                        f"table {entry.get('name')!r}: versions must be an array"
+                    )
+            else:
+                extra = sorted(set(entry) - plain_fields)
+                if extra:
+                    raise SnapshotError(
+                        f"table entry has unexpected field: {extra[0]}"
+                    )
+                missing = sorted(plain_fields - set(entry))
+                if missing:
+                    raise SnapshotError(
+                        f"table entry missing required field: {missing[0]}"
+                    )
+                raw_rows = entry["rows"]
+                if not isinstance(raw_rows, list):
+                    raise SnapshotError(
+                        f"table {entry.get('name')!r}: rows must be an array"
+                    )
             name = entry["name"]
             if not isinstance(name, str) or not name:
                 raise SnapshotError("table name must be a non-empty string")
             if previous_name is not None and name <= previous_name:
                 raise SnapshotError("tables must be strictly ordered by name")
             previous_name = name
-            raw_rows = entry["rows"]
-            if not isinstance(raw_rows, list):
-                raise SnapshotError(f"table {name!r}: rows must be an array")
-            rows: dict[str, str] = {}
-            previous_key: str | None = None
-            for raw in raw_rows:
-                if not isinstance(raw, dict):
-                    raise SnapshotError(f"table {name!r}: rows entries must be objects")
-                extra = sorted(set(raw) - {"key", "label"})
-                if extra:
-                    raise SnapshotError(
-                        f"table {name!r}: row has unexpected field: {extra[0]}"
-                    )
-                missing = sorted({"key", "label"} - set(raw))
-                if missing:
-                    raise SnapshotError(
-                        f"table {name!r}: row missing required field: {missing[0]}"
-                    )
-                key = raw["key"]
-                label = raw["label"]
-                if not isinstance(key, str) or not key:
-                    raise SnapshotError(
-                        f"table {name!r}: row key must be a non-empty string"
-                    )
-                if not isinstance(label, str) or not label:
-                    raise SnapshotError(
-                        f"table {name!r}: row label must be a non-empty string"
-                    )
-                if previous_key is not None and key <= previous_key:
-                    raise SnapshotError(
-                        f"table {name!r}: rows must be strictly ordered by key"
-                    )
-                previous_key = key
-                rows[key] = label
-            tables[name] = rows
+            if has_mode_field:
+                tables[name] = Service._parse_version_rows(name, raw_rows)
+            else:
+                tables[name] = Service._parse_plain_rows(name, raw_rows)
         return tables
+
+    @staticmethod
+    def _parse_plain_rows(name: str, raw_rows: object) -> _Table:
+        if not isinstance(raw_rows, list):
+            raise SnapshotError(f"table {name!r}: rows must be an array")
+        table = _Table(name, event_time_versioned=False)
+        previous_key: str | None = None
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                raise SnapshotError(f"table {name!r}: rows entries must be objects")
+            extra = sorted(set(raw) - {"key", "label"})
+            if extra:
+                raise SnapshotError(
+                    f"table {name!r}: row has unexpected field: {extra[0]}"
+                )
+            missing = sorted({"key", "label"} - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"table {name!r}: row missing required field: {missing[0]}"
+                )
+            key = raw["key"]
+            label = raw["label"]
+            if not isinstance(key, str) or not key:
+                raise SnapshotError(
+                    f"table {name!r}: row key must be a non-empty string"
+                )
+            if not isinstance(label, str) or not label:
+                raise SnapshotError(
+                    f"table {name!r}: row label must be a non-empty string"
+                )
+            if previous_key is not None and key <= previous_key:
+                raise SnapshotError(
+                    f"table {name!r}: rows must be strictly ordered by key"
+                )
+            previous_key = key
+            table.rows[key] = label
+        return table
+
+    @staticmethod
+    def _parse_version_rows(name: str, raw_rows: object) -> _Table:
+        if not isinstance(raw_rows, list):
+            raise SnapshotError(f"table {name!r}: versions must be an array")
+        table = _Table(name, event_time_versioned=True)
+        previous: tuple | None = None
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                raise SnapshotError(
+                    f"table {name!r}: versions entries must be objects"
+                )
+            fields = {"key", "label", "effective_from_ms"}
+            extra = sorted(set(raw) - fields)
+            if extra:
+                raise SnapshotError(
+                    f"table {name!r}: version row has unexpected field: {extra[0]}"
+                )
+            missing = sorted(fields - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"table {name!r}: version row missing required field: "
+                    f"{missing[0]}"
+                )
+            key = raw["key"]
+            label = raw["label"]
+            effective_from_ms = raw["effective_from_ms"]
+            if not isinstance(key, str) or not key:
+                raise SnapshotError(
+                    f"table {name!r}: version row key must be a non-empty string"
+                )
+            if not isinstance(label, str) or not label:
+                raise SnapshotError(
+                    f"table {name!r}: version row label must be a non-empty string"
+                )
+            if not _is_int(effective_from_ms):
+                raise SnapshotError(
+                    f"table {name!r}: version row effective_from_ms must be an "
+                    f"integer"
+                )
+            order_key = (key, effective_from_ms)
+            if previous is not None and order_key <= previous:
+                raise SnapshotError(
+                    f"table {name!r}: versions must be strictly ordered by "
+                    f"key, effective_from_ms"
+                )
+            previous = order_key
+            table.versions.setdefault(key, {})[effective_from_ms] = label
+        return table
 
     def _get(self, name: str) -> _Stream:
         try:

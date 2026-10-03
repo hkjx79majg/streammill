@@ -15,9 +15,11 @@ from .service import (
     ChangeCursorAheadError,
     ChangeCursorExpiredError,
     ChangeFeedNotEnabledError,
+    DimensionVersionConflictError,
     EventIdConflictError,
     JoinNotEnabledError,
     LookupKeyNotFoundError,
+    LookupVersionNotFoundError,
     RestoreConflictError,
     Service,
     SnapshotError,
@@ -89,9 +91,15 @@ _EVENT_JOIN_FIELDS = {
 _TABLE_FIELDS = {
     "name": lambda v: isinstance(v, str) and len(v) > 0,
 }
+_TABLE_OPTIONAL_FIELDS = {
+    "event_time_versioned": lambda v: isinstance(v, bool),
+}
 _ROW_FIELDS = {
     "key": lambda v: isinstance(v, str) and len(v) > 0,
     "label": lambda v: isinstance(v, str) and len(v) > 0,
+}
+_ROW_VERSION_FIELDS = {
+    "effective_from_ms": _is_int,
 }
 _WATERMARK_FIELDS = {
     "watermark_ms": _is_int,
@@ -250,19 +258,42 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(201, payload)
 
     def _create_table(self) -> None:
-        values = _validate(self._read_json(), _TABLE_FIELDS)
+        values = _validate(
+            self._read_json(), _TABLE_FIELDS, _TABLE_OPTIONAL_FIELDS
+        )
+        versioned = values.get("event_time_versioned", False)
         try:
-            payload = self.service.create_table(values["name"])
+            payload = self.service.create_table(values["name"], versioned)
         except TableExistsError:
             raise _RequestError(409, "table_exists", f"table already exists: {values['name']}") from None
         self.send_json(201, payload)
 
     def _put_row(self, table: str) -> None:
-        values = _validate(self._read_json(), _ROW_FIELDS)
+        body = self._read_json()
+        features = self.service.table_features(table)
+        fields = dict(_ROW_FIELDS)
+        if features is not None and features["event_time_versioned"]:
+            fields.update(_ROW_VERSION_FIELDS)
+        # Unknown tables validate against the plain-row shape, matching
+        # the historical 422-before-404 ordering; effective_from_ms
+        # stays undeclared on a plain table.
+        values = _validate(body, fields)
         try:
-            payload = self.service.put_row(table, values["key"], values["label"])
+            payload = self.service.put_row(
+                table,
+                values["key"],
+                values["label"],
+                values.get("effective_from_ms"),
+            )
         except TableNotFoundError:
             raise _RequestError(404, "table_not_found", f"unknown table: {table}") from None
+        except DimensionVersionConflictError:
+            raise _RequestError(
+                409,
+                "dimension_version_conflict",
+                f"conflicting dimension version: {values['key']} at "
+                f"{values['effective_from_ms']}",
+            ) from None
         self.send_json(200, payload)
 
     def _add_event(self, name: str) -> None:
@@ -295,6 +326,10 @@ class Handler(BaseHTTPRequestHandler):
         except LookupKeyNotFoundError:
             raise _RequestError(
                 409, "lookup_key_not_found", f"unknown lookup_key: {values['lookup_key']}"
+            ) from None
+        except LookupVersionNotFoundError as exc:
+            raise _RequestError(
+                409, "lookup_version_not_found", str(exc)
             ) from None
         self.send_json(200, payload)
 
@@ -331,6 +366,10 @@ class Handler(BaseHTTPRequestHandler):
         except LookupKeyNotFoundError as exc:
             raise _RequestError(
                 409, "lookup_key_not_found", f"unknown lookup_key: {exc}"
+            ) from None
+        except LookupVersionNotFoundError as exc:
+            raise _RequestError(
+                409, "lookup_version_not_found", str(exc)
             ) from None
         self.send_json(200, payload)
 

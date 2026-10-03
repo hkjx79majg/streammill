@@ -77,6 +77,15 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - 成功批次保留 `batch_id`、请求与完整响应。保留期内以字段值与事件顺序相同的请求重试，原样返回首次响应且不再写入（重试不刷新保留顺序）；同一 `batch_id` 内容不同返回 409 `batch_id_conflict`。仅保留最近 `batch_retention` 条，淘汰后的标识可复用，并发同标识至多提交一次。
 - 存在任意批次流时 `GET /snapshot` 导出 `format_version: 4`（始终携带 `tables` 数组），对应流额外携带 `batch_retention` 与按提交顺序排列的 `batches` 记录（`batch_id`、`request`、`response`）。恢复兼容 version 1 至 3，并严格校验 version 4：重复标识、记录条数超过 `batch_retention`、请求或响应形状不合法均返回 422 `invalid_snapshot` 且不发布部分状态；恢复后重放与淘汰顺序和未中断实例一致。健康检查、单事件入口、水位线、结果查询、连接与变更流的既有行为不变。
 
+## 可选的事件时间版本维表
+
+- `POST /tables` 可额外声明布尔字段 `event_time_versioned: true` 创建事件时间版本维表，成功响应回显该字段；未声明或显式为 `false` 时沿用现有创建、覆盖式写行与当前值连接语义，响应与快照形状均不变。字段类型错误或含未声明字段返回 422 `invalid_request`。
+- 版本维表通过同一写行入口接收非空字符串 `key`、`label` 与整数 `effective_from_ms`（允许负数与零）。同一 key 的版本从其 `effective_from_ms` 生效直到该 key 的下一版本之前，且允许乱序写入：首次写入该 key、或写入新的生效时间返回 `changed: true`；以完全相同的 `(key, effective_from_ms, label)` 重试返回 `changed: false`；同一 key 与 `effective_from_ms` 已存在但 `label` 不同，返回 409 `dimension_version_conflict` 且历史不变（其它 key 与其它生效时间不受影响）。普通维表携带 `effective_from_ms`、版本维表缺失该字段，均返回 422 `invalid_request`；未知表仍保持 422 先于 404 `table_not_found` 的既有优先级。
+- 连接流引用版本维表后，事件字段要求、去重（冲突比较仍包含 `lookup_key`）、迟到与自动水位线规则不变；只是在既有去重与迟到判断之后、任何状态变更之前，以事件自身 `timestamp_ms` 选择不晚于该时间的最新版本取得 `label`（边界取等：事件时间恰等于某版本生效时间即使用该版本），随后沿用现有窗口与 `(lookup_key, label)` 分组聚合、最终化与 joined-results 排序。
+- `lookup_key` 不存在，或事件时间早于该 key 的首个版本，返回 409 `lookup_version_not_found`；该事件不改变聚合、去重、水位线、批次与变更序号（变更流不消耗序号）。之后补写更早的维度历史不重算已接收事件；但迟到或回填事件在其被接收时按自身事件时间解析当时有效版本。批次中任一元素找不到版本（或发生既有冲突）时整批回滚，不占用 `batch_id`。
+- 只要存在任意版本维表，`GET /snapshot` 即导出 `format_version: 5`，文档始终携带 `tables` 数组，且每个表对象记录模式：普通表仍为 `{name, rows}`，版本表为 `{name, event_time_versioned: true, versions}`，其版本行为 `{key, label, effective_from_ms}` 并按 `key`、`effective_from_ms` 严格升序导出；连接流形状与更低版本一致。
+- 恢复继续兼容 version 1 至 4（旧文档中的表只能是普通形状，出现模式字段即 422），并严格校验 version 5：模式字段组合错误（标记非 `true`、有 `versions` 无标记、有标记无 `versions`、同时出现 `rows` 与 `versions`、未声明字段等）、版本行重复或乱序、无效 `effective_from_ms`（非整数、布尔、空串等）、同一 `(key, effective_from_ms)` 冲突、空 key/label，均返回 422 `invalid_snapshot` 且不发布任何部分状态；恢复后的版本解析、重试与冲突行为与未中断实例等价，无写入再次导出与原文档完全相同。普通维表、未连接流、已有结果与 joined-results 排序、迟到与自动水位线、去重淘汰、变更流游标、批次重放、健康检查及既有错误优先级均保持不变。
+
 ## 验证
 
 ```bash
