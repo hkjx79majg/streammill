@@ -43,7 +43,22 @@ restore is only accepted on an instance without any streams, validates
 the document strictly (never silently repairing it) and publishes the
 whole state atomically.
 
-Automatic watermarks, joins and disk persistence remain out of scope.
+Streams may additionally run in automatic-watermark mode by passing a
+non-negative ``auto_watermark_lag_ms`` at creation time. Such a stream
+tracks the largest ``timestamp_ms`` of every successfully accepted
+event; after an event has been aggregated (and its id registered, when
+deduplication is enabled) the watermark is atomically advanced to the
+greater of its current value and ``max_event_timestamp_ms - lag``,
+finalizing the same windows a manual advance would. Events that are
+dropped as late, reported as exact duplicates or rejected as
+``event_id_conflict`` never move the maximum event timestamp or the
+watermark. A manual watermark POST still works on an automatic stream
+and is never regressed by later automatic advances. Snapshot documents
+for automatic streams additionally carry ``auto_watermark_lag_ms`` and
+``max_event_timestamp_ms``; documents without both fields restore as
+manual streams byte-for-byte compatible with the original format.
+
+Joins and disk persistence remain out of scope.
 """
 
 from __future__ import annotations
@@ -101,12 +116,19 @@ class _Stream:
         window_ms: int,
         allowed_lateness_ms: int,
         dedup_retention_ms: int | None = None,
+        auto_watermark_lag_ms: int | None = None,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
         self.allowed_lateness_ms = allowed_lateness_ms
         self.dedup_retention_ms = dedup_retention_ms
+        # None selects manual watermark mode; a non-negative integer the
+        # event-time lag used for automatic advancement.
+        self.auto_watermark_lag_ms = auto_watermark_lag_ms
         self.watermark: int | None = None
+        # Largest timestamp_ms of a successfully accepted event. It stays
+        # None until the first non-dropped, non-duplicate event lands.
+        self.max_event_timestamp_ms: int | None = None
         # window_start_ms -> [count, sum]; only non-empty windows exist.
         self._windows: dict[int, list] = {}
         self._finalized: list[dict] = []
@@ -116,30 +138,68 @@ class _Stream:
 
     def add_event(
         self, timestamp_ms: int, value: float, event_id: str | None = None
-    ) -> dict:
+    ) -> tuple[dict, list[dict]]:
+        """Process one event and return ``(outcome, finalized)``.
+
+        ``outcome`` mirrors the historical event response fields; in
+        automatic mode the caller also reports ``watermark_ms`` and the
+        windows finalized by this event's automatic advancement.
+        """
         if self.dedup_retention_ms is not None:
             retained = self._dedup.get(event_id)
             if retained is not None:
                 kept_ts, kept_value = retained
                 if kept_ts == timestamp_ms and kept_value == value:
-                    return {"dropped": False, "duplicate": True}
+                    # Duplicates never move max event time or watermark.
+                    return {"dropped": False, "duplicate": True}, []
                 raise EventIdConflictError(event_id)
             if (
                 self.watermark is not None
                 and timestamp_ms < self.watermark - self.allowed_lateness_ms
             ):
-                # Unseen too-late ids are dropped without being remembered.
-                return {"dropped": True, "duplicate": False}
+                # Unseen too-late ids are dropped without being remembered;
+                # they never move max event time or watermark either.
+                return {"dropped": True, "duplicate": False}, []
             self._aggregate(timestamp_ms, value)
             self._dedup[event_id] = (timestamp_ms, value)
-            return {"dropped": False, "duplicate": False}
+            outcome = {"dropped": False, "duplicate": False}
+        else:
+            if (
+                self.watermark is not None
+                and timestamp_ms < self.watermark - self.allowed_lateness_ms
+            ):
+                return {"dropped": True}, []
+            self._aggregate(timestamp_ms, value)
+            outcome = {"dropped": False}
+        # Only an event that was actually aggregated reaches this point.
+        finalized = self._advance_auto_watermark(timestamp_ms)
+        return outcome, finalized
+
+    def _advance_auto_watermark(self, timestamp_ms: int) -> list[dict]:
+        """Fold an accepted event into max event time / watermark.
+
+        The watermark moves to the greater of its current value and
+        ``max_event_timestamp_ms - lag``, so older-but-acceptable events
+        and prior manual advances never regress it. While the computed
+        target is negative there is no effective watermark yet and the
+        stream keeps ``watermark is None`` (event timestamps may be
+        negative); a manually established negative watermark still
+        counts and is advanced monotonically past it.
+        """
+        if self.auto_watermark_lag_ms is None:
+            return []
         if (
-            self.watermark is not None
-            and timestamp_ms < self.watermark - self.allowed_lateness_ms
+            self.max_event_timestamp_ms is None
+            or timestamp_ms > self.max_event_timestamp_ms
         ):
-            return {"dropped": True}
-        self._aggregate(timestamp_ms, value)
-        return {"dropped": False}
+            self.max_event_timestamp_ms = timestamp_ms
+        target = self.max_event_timestamp_ms - self.auto_watermark_lag_ms
+        if self.watermark is None:
+            if target < 0:
+                return []
+        elif target <= self.watermark:
+            return []
+        return self.advance_watermark(target)
 
     def _aggregate(self, timestamp_ms: int, value: float) -> None:
         start = (timestamp_ms // self.window_ms) * self.window_ms
@@ -211,6 +271,9 @@ class _Stream:
                 {"event_id": event_id, "timestamp_ms": kept[0], "value": kept[1]}
                 for event_id, kept in sorted(self._dedup.items())
             ]
+        if self.auto_watermark_lag_ms is not None:
+            entry["auto_watermark_lag_ms"] = self.auto_watermark_lag_ms
+            entry["max_event_timestamp_ms"] = self.max_event_timestamp_ms
         return entry
 
     @classmethod
@@ -231,6 +294,8 @@ class _Stream:
             "windows",
             "finalized",
             "dedup_records",
+            "auto_watermark_lag_ms",
+            "max_event_timestamp_ms",
         }
         extra = sorted(set(data) - allowed)
         if extra:
@@ -268,12 +333,30 @@ class _Stream:
             raise SnapshotError(
                 f"stream {name!r}: dedup_retention_ms must be at least allowed_lateness_ms"
             )
+        has_lag_field = "auto_watermark_lag_ms" in data
+        has_max_field = "max_event_timestamp_ms" in data
+        if has_lag_field != has_max_field:
+            raise SnapshotError(
+                f"stream {name!r}: auto_watermark_lag_ms and max_event_timestamp_ms "
+                f"must be present together"
+            )
+        lag = data.get("auto_watermark_lag_ms")
+        if has_lag_field and (not _is_int(lag) or lag < 0):
+            raise SnapshotError(
+                f"stream {name!r}: auto_watermark_lag_ms must be a non-negative integer"
+            )
+        max_event_ts = data.get("max_event_timestamp_ms")
+        if has_max_field and max_event_ts is not None and not _is_int(max_event_ts):
+            raise SnapshotError(
+                f"stream {name!r}: max_event_timestamp_ms must be an integer or null"
+            )
         watermark = data.get("watermark_ms")
         if watermark is not None and not _is_int(watermark):
             raise SnapshotError(f"stream {name!r}: watermark_ms must be an integer or null")
 
-        stream = cls(name, window_ms, allowed_lateness_ms, retention)
+        stream = cls(name, window_ms, allowed_lateness_ms, retention, lag)
         stream.watermark = watermark
+        stream.max_event_timestamp_ms = max_event_ts
 
         finalized_rows = cls._parse_window_list(
             data.get("finalized"),
@@ -327,6 +410,43 @@ class _Stream:
             raise SnapshotError(
                 f"stream {name!r}: dedup_records present without dedup_retention_ms"
             )
+
+        if lag is not None:
+            buckets = set(stream._windows) | stream._finalized_starts
+            if max_event_ts is None:
+                if buckets:
+                    raise SnapshotError(
+                        f"stream {name!r}: max_event_timestamp_ms is null but the "
+                        f"stream holds aggregated events"
+                    )
+            else:
+                bucket = (max_event_ts // window_ms) * window_ms
+                if bucket not in buckets:
+                    raise SnapshotError(
+                        f"stream {name!r}: max_event_timestamp_ms {max_event_ts} "
+                        f"does not fall into an existing open or finalized window"
+                    )
+                if watermark is None:
+                    if max_event_ts - lag >= 0:
+                        raise SnapshotError(
+                            f"stream {name!r}: max_event_timestamp_ms - lag "
+                            f"({max_event_ts - lag}) already yields an effective "
+                            f"watermark but watermark_ms is null"
+                        )
+                elif watermark < max_event_ts - lag:
+                    raise SnapshotError(
+                        f"stream {name!r}: watermark {watermark} must not be below "
+                        f"max_event_timestamp_ms - lag ({max_event_ts - lag})"
+                    )
+                stale = next(
+                    (event_id for event_id, kept in stream._dedup.items() if kept[0] > max_event_ts),
+                    None,
+                )
+                if stale is not None:
+                    raise SnapshotError(
+                        f"stream {name!r}: dedup record {stale!r} is newer than "
+                        f"max_event_timestamp_ms"
+                    )
         return stream
 
     @staticmethod
@@ -487,12 +607,17 @@ class Service:
         window_ms: int,
         allowed_lateness_ms: int,
         dedup_retention_ms: int | None = None,
+        auto_watermark_lag_ms: int | None = None,
     ) -> dict:
         with self._lock:
             if name in self._streams:
                 raise StreamExistsError(name)
             self._streams[name] = _Stream(
-                name, window_ms, allowed_lateness_ms, dedup_retention_ms
+                name,
+                window_ms,
+                allowed_lateness_ms,
+                dedup_retention_ms,
+                auto_watermark_lag_ms,
             )
         payload = {
             "stream": name,
@@ -501,6 +626,8 @@ class Service:
         }
         if dedup_retention_ms is not None:
             payload["dedup_retention_ms"] = dedup_retention_ms
+        if auto_watermark_lag_ms is not None:
+            payload["auto_watermark_lag_ms"] = auto_watermark_lag_ms
         return payload
 
     def dedup_enabled(self, name: str) -> bool | None:
@@ -513,7 +640,15 @@ class Service:
         self, name: str, timestamp_ms: int, value: float, event_id: str | None = None
     ) -> dict:
         with self._lock:
-            outcome = self._get(name).add_event(timestamp_ms, value, event_id)
+            stream = self._get(name)
+            outcome, finalized = stream.add_event(timestamp_ms, value, event_id)
+            if stream.auto_watermark_lag_ms is not None:
+                return {
+                    "stream": name,
+                    **outcome,
+                    "watermark_ms": stream.watermark,
+                    "finalized": finalized,
+                }
         return {"stream": name, **outcome}
 
     def advance_watermark(self, name: str, watermark_ms: int) -> dict:

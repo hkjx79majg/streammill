@@ -61,6 +61,7 @@ _CREATE_FIELDS = {
 }
 _CREATE_OPTIONAL_FIELDS = {
     "dedup_retention_ms": lambda v: _is_int(v) and v > 0,
+    "auto_watermark_lag_ms": lambda v: _is_int(v) and v >= 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -177,6 +178,7 @@ class Handler(BaseHTTPRequestHandler):
                 values["window_ms"],
                 values["allowed_lateness_ms"],
                 retention,
+                values.get("auto_watermark_lag_ms"),
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
