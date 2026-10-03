@@ -7,9 +7,12 @@ import json
 import math
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .service import (
+    ChangeCursorAheadError,
+    ChangeCursorExpiredError,
+    ChangeFeedNotEnabledError,
     EventIdConflictError,
     JoinNotEnabledError,
     LookupKeyNotFoundError,
@@ -68,6 +71,7 @@ _CREATE_OPTIONAL_FIELDS = {
     "auto_watermark_lag_ms": lambda v: _is_int(v) and v >= 0,
     "slide_ms": lambda v: _is_int(v) and v > 0,
     "lookup_table": lambda v: isinstance(v, str) and len(v) > 0,
+    "change_retention": lambda v: _is_int(v) and v > 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -167,6 +171,12 @@ class Handler(BaseHTTPRequestHandler):
             except JoinNotEnabledError:
                 self.send_error_json(409, "join_not_enabled", f"stream has no lookup_table: {segments[1]}")
             return
+        if len(segments) == 3 and segments[0] == "streams" and segments[2] == "changes":
+            try:
+                self._get_changes(segments[1])
+            except _RequestError as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
@@ -218,6 +228,7 @@ class Handler(BaseHTTPRequestHandler):
                 values.get("auto_watermark_lag_ms"),
                 slide,
                 values.get("lookup_table"),
+                values.get("change_retention"),
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
@@ -285,6 +296,49 @@ class Handler(BaseHTTPRequestHandler):
         except WatermarkRegressionError:
             raise _RequestError(409, "watermark_regression", "watermark must not move backwards") from None
         self.send_json(200, payload)
+
+    def _get_changes(self, name: str) -> None:
+        after_seq, limit = self._changes_params()
+        try:
+            payload = self.service.changes(name, after_seq, limit)
+        except StreamNotFoundError:
+            raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        except ChangeFeedNotEnabledError:
+            raise _RequestError(
+                409, "change_feed_not_enabled", f"stream has no change feed: {name}"
+            ) from None
+        except ChangeCursorAheadError:
+            raise _RequestError(
+                409, "change_cursor_ahead", f"cursor is past the latest seq: {after_seq}"
+            ) from None
+        except ChangeCursorExpiredError:
+            raise _RequestError(
+                410, "change_cursor_expired", f"cursor is behind the retained records: {after_seq}"
+            ) from None
+        self.send_json(200, payload)
+
+    def _changes_params(self) -> tuple[int, int]:
+        """Validate the after_seq/limit query pair of the changes route."""
+        pairs = parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
+        names = sorted(key for key, _ in pairs)
+        if len(pairs) != 2 or names != ["after_seq", "limit"]:
+            raise _invalid_request(
+                "expected exactly the query parameters: after_seq, limit"
+            )
+        raw = dict(pairs)
+        after_seq = self._query_int("after_seq", raw["after_seq"])
+        if after_seq < 0:
+            raise _invalid_request("after_seq must be a non-negative integer")
+        limit = self._query_int("limit", raw["limit"])
+        if not 1 <= limit <= 1000:
+            raise _invalid_request("limit must be between 1 and 1000")
+        return after_seq, limit
+
+    @staticmethod
+    def _query_int(field: str, raw: str) -> int:
+        if not raw.isdigit():
+            raise _invalid_request(f"invalid value for query parameter: {field}")
+        return int(raw)
 
     def _restore_snapshot(self) -> None:
         document = self._read_json()

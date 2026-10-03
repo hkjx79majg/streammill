@@ -60,6 +60,14 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - `GET /streams/{name}/joined-results` 仅返回最终分组（`stream`、`window_start_ms`、`window_end_ms`、`lookup_key`、`label`、`count`、`sum`），按窗口起点、`lookup_key`、`label` 升序；普通流返回 409 `join_not_enabled`，未知流返回 404 `stream_not_found`。
 - 存在任意维表时 `GET /snapshot` 导出 `format_version: 2`：`tables` 按名称、其行按 `key` 排序，连接流额外携带 `lookup_table`、`joined_windows`、`joined_finalized`（去重记录含 `lookup_key`）。恢复兼容 version 1，严格校验 version 2：未知表引用、重复或乱序键、分组与基础窗口不一致、非有限聚合值或错误排序均返回 422 `invalid_snapshot` 且不发布部分状态；已有流或表时返回 409 `restore_conflict`。未使用连接时，既有接口、错误优先级、响应与 version 1 快照不变。
 
+## 可选的窗口物化变更流
+
+- `POST /streams` 可额外携带 `change_retention`（正整数），限定变更流最多保留的记录条数并在创建响应中回显；不提供时不启用变更流，既有接口、响应与快照行为完全不变。
+- 启用后 `GET /streams/{name}/changes?after_seq=N&limit=L` 返回 `seq` 大于 `N` 的保留记录：`N` 为非负整数，`L` 为 1 至 1000；响应为 `{"stream", "latest_seq", "changes"}`，`changes` 按 `seq` 递增，初始 `latest_seq` 为 0。缺失、重复、未知或越界参数返回 422 `invalid_request`（参数校验先于流存在性检查）。
+- `seq` 从 1 连续递增。每个成功聚合的事件为其影响的每个基础窗口产生一条 `kind: "upsert"` 记录，携带 `seq`、`window_start_ms`、`window_end_ms` 与更新后的 `count`、`sum`；滑动窗口按起点递增产生多条。水位线推进最终化窗口时为每个新最终窗口产生一条 `kind: "final"` 记录（含最终 `count`、`sum`）；自动最终化时同一次提交先排列全部 upsert 再排列全部 final，手工水位线只产生 final，无新最终结果则不产生记录。精确重复、过迟丢弃、`event_id_conflict`、`lookup_key_not_found` 与校验失败都不消耗序号；连接流只发布基础窗口变更，分组结果不变。并发写入在同一把状态锁内形成与聚合一致的全序，读取只能看到完整提交。
+- 每次提交后裁掉最旧记录，最多保留 `change_retention` 条，`latest_seq` 不回退。`after_seq` 大于 `latest_seq` 返回 409 `change_cursor_ahead`；仍有保留记录且 `after_seq` 小于最早保留 `seq` 减一时返回 410 `change_cursor_expired`；未知流返回 404 `stream_not_found`，未启用变更流的流返回 409 `change_feed_not_enabled`，错误体沿用 `{"error": {"code", "message"}}`。
+- 存在任意启用变更流的流时 `GET /snapshot` 导出 `format_version: 3`：文档始终携带 `tables` 数组（含既有表与连接状态），启用变更流的流对象额外包含 `change_retention`、`latest_seq` 与保留的 `changes` 记录。恢复兼容 version 1 与 2，并严格校验 version 3：序号连续性（保留记录为以 `latest_seq` 结尾的连续序号，条数不超过 `change_retention` 且在序号超过上限后恰好等于上限）、排序、窗口起点与网格对齐及宽度、记录引用的窗口必须存在、每个窗口至多一条 final 且其后无记录、各窗口最后一条保留记录的 kind 与 `count`/`sum` 必须和该窗口聚合状态一致，任一不合法均返回 422 `invalid_snapshot` 且不发布任何状态。恢复后游标与下一序号连续，继续写入、裁剪与再次导出和未中断实例等价；未启用变更流的实例继续导出版本 1 或 2 的原始形状。
+
 ## 验证
 
 ```bash

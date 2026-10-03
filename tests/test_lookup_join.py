@@ -418,7 +418,8 @@ class JoinedSnapshotTest(HttpTestCase):
         self.assert_invalid(doc)
         # v1 documents must not carry tables
         self.assert_invalid({"format_version": 1, "streams": [], "tables": []})
-        self.assert_invalid({"format_version": 3, "streams": [], "tables": []})
+        # versions beyond the change-feed format (3) are still unsupported
+        self.assert_invalid({"format_version": 4, "streams": [], "tables": []})
 
     def test_table_validation(self):
         good = self._doc(self._joined_stream())
