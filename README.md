@@ -51,10 +51,24 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - `POST /snapshot/restore` 仅允许在尚未创建任何流的实例上调用，成功返回 200 `{"restored_streams": N}` 并一次性发布全部状态，其他请求不会观察到部分流；空快照 `{"format_version": 1, "streams": []}` 合法并返回零。恢复后结果查询与导出前一致，开放窗口可继续接收合规事件并在后续水位线下正确最终化，已最终化窗口不会再次进入 `finalized`，保留的标识继续执行重复/冲突判断且淘汰边界不变；自动流恢复后的自动推进、去重与最终结果与导出前一致；滑动流恢复后的继续写入（事件计入全部重叠窗口）、去重淘汰、手工或自动推进及再次导出与未中断实例等价；无写入的再次导出在语义与数组顺序上完全相同。
 - 恢复严格校验且不静默修正：请求体不是合法 JSON 返回 400 `invalid_json`；对象结构、字段类型、`format_version`（仅支持 1，其他版本同样拒绝）、流名唯一性与升序、配置约束（含 `dedup_retention_ms >= allowed_lateness_ms`，以及滑动流的 `slide_ms` 为正整数、不大于 `window_ms` 且整除 `window_ms`）、数组排序、窗口宽度、起点与网格步长对齐、窗口开闭关系、最终结果与水位线/迟到配置的关系、重复窗口或重复 `event_id`、去重记录的保留期边界与所属各窗口计数关系任一不合法，均返回 422 `invalid_snapshot`，实例保持完全为空。自动流的两个字段必须成对出现且类型合法（`auto_watermark_lag_ms` 为非负整数，`max_event_timestamp_ms` 为整数或 `null`）；非空最大事件时间聚合到的每个窗口都必须是已有开放或最终窗口，且水位线不得低于最大事件时间减去滞后量。实例中已存在任意流时，对任何可解析的快照文档都返回 409 `restore_conflict`（请求体本身不是合法 JSON 时仍按请求格式错误返回 400 `invalid_json`），原状态不变。健康检查、手工流、滑动/滚动流间隔离以及其他既有错误优先级均不改变。
 
+## 进程内维表与可选当前值连接
+
+- `POST /tables` 以非空 `name` 建表，成功返回 201；重名返回 409 `table_exists`。
+- `POST /tables/{name}/rows` 以非空字符串 `key`、`label` 写行；未知表返回 404 `table_not_found`（请求体验证先于存在性检查）。新增或改值返回 `changed: true`，相同重试返回 `changed: false`。
+- `POST /streams` 可额外携带 `lookup_table`（非空字符串），只能引用已有表并在创建响应中回显；引用未知表返回 422 `invalid_request`，流不会被创建。不提供时流的请求、响应与快照形状与基线完全一致。
+- 连接流事件须携带非空 `lookup_key`（缺失或类型错误返回 422 `invalid_request`）；普通流仍把 `lookup_key` 视为未声明字段。事件先按既有规则去重、判断迟到，再原子读取当前 `label`：键不存在返回 409 `lookup_key_not_found`，聚合、去重与水位线状态均不变；过迟事件在查表前即按 `dropped` 处理。
+- 成功事件仍计入总量窗口，并按 `lookup_key` 与处理时的 `label` 分组聚合 `count`、`sum`；改表仅影响后续事件，已聚合分组保留当时的 `label`。启用去重时保留内容包含 `lookup_key`，同一 `event_id` 换键返回 409 `event_id_conflict`。滑动流把事件计入全部重叠窗口，窗口关闭时其分组同步最终化。
+- `GET /streams/{name}/joined-results` 仅返回最终分组（`stream`、`window_start_ms`、`window_end_ms`、`lookup_key`、`label`、`count`、`sum`），按窗口起点、`lookup_key`、`label` 升序；普通流返回 409 `join_not_enabled`，未知流返回 404 `stream_not_found`。
+
+## 全量状态快照与恢复（含连接状态）
+
+- 未使用连接时 `GET /snapshot` 仍返回 `format_version: 1` 文档，形状与基线完全一致；一旦存在任何维表，导出升级为 `format_version: 2`，额外包含 `tables`（按表名升序，行按 `key` 升序），连接流额外携带 `lookup_table`、`joined_windows`（未关闭窗口的分组）与 `joined_finalized`（已最终分组），分组均按 `(window_start_ms, lookup_key, label)` 升序。
+- `POST /snapshot/restore` 兼容 version 1 文档（行为不变），并严格校验 version 2：未知表引用、重复或乱序的表名/行键/分组、分组与基础窗口计数不一致、非有限聚合值或错误排序均返回 422 `invalid_snapshot` 且不发布任何部分状态；实例中已有任意流或表时返回 409 `restore_conflict`。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-快照覆盖进程内全量状态，可用于跨实例/重启的人工恢复；连接与落盘持久化仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。
+快照覆盖进程内全量状态（含维表与连接分组），可用于跨实例/重启的人工恢复；落盘持久化仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。
