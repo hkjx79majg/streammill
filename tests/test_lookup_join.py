@@ -418,7 +418,13 @@ class JoinedSnapshotTest(HttpTestCase):
         self.assert_invalid(doc)
         # v1 documents must not carry tables
         self.assert_invalid({"format_version": 1, "streams": [], "tables": []})
-        self.assert_invalid({"format_version": 3, "streams": [], "tables": []})
+        self.assert_invalid({"format_version": 4, "streams": [], "tables": []})
+        # v3 (change feed) documents are accepted; an empty one restores zero
+        status, payload = self.restore(
+            {"format_version": 3, "streams": [], "tables": []}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"restored_streams": 0})
 
     def test_table_validation(self):
         good = self._doc(self._joined_stream())

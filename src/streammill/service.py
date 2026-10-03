@@ -96,6 +96,47 @@ streams) whenever any table exists, and restore stays compatible with
 version 1 documents. When the join is unused every public shape and the
 version 1 snapshot are unchanged.
 
+Streams may optionally materialize a window change feed for live
+dashboards by passing a positive ``change_retention`` at creation time
+(the value is echoed in the response and caps how many records are
+kept). Without it the feed is disabled and every existing interface,
+response and snapshot shape is unchanged. On enabled streams:
+
+* every successfully aggregated event appends one ``upsert`` record per
+  affected base window (ascending by window start, so sliding events
+  produce several), carrying a consecutive ``seq`` starting at 1, the
+  window bounds and the updated ``count``/``sum``;
+* finalization appends ``final`` records with the window's terminal
+  aggregates — after the event's own upserts when an automatic
+  watermark advance finalizes, and as the only records of a manual
+  advance (an advance that finalizes nothing appends nothing);
+* exact duplicates, too-late drops, ``event_id_conflict``,
+  ``lookup_key_not_found`` and validation failures never consume a
+  sequence number, and joined streams publish base-window changes only
+  (the grouped results are unaffected);
+* after each commit the oldest records are trimmed down to
+  ``change_retention``; ``latest_seq`` (initially 0) never regresses.
+
+``Service.changes`` reads the feed with a cursor: records with
+``seq > after_seq`` in ascending order, at most ``limit`` entries. A
+cursor beyond ``latest_seq`` raises ChangeCursorAheadError; a cursor
+older than the earliest retained record (when any records are retained)
+raises ChangeCursorExpiredError. All appends happen under the service
+lock together with the aggregation itself, so concurrent writes form a
+single total order and readers only ever observe complete commits.
+
+Instances with at least one change-feed stream export snapshots as
+``format_version`` 3: the version 2 shape (tables plus joined state)
+with ``change_retention``, ``latest_seq`` and the retained ``changes``
+on each enabled stream. Restore validates the feed strictly — sequence
+continuity against ``latest_seq``, the retention cap, ordering, window
+boundaries, and that each window's last retained record matches the
+aggregate state — and rejects any violation with SnapshotError without
+publishing state. A restored feed continues the cursor and the next
+sequence number exactly where the exported instance left off. Versions
+1 and 2 remain accepted, and instances without a change feed keep
+exporting their original version and shape.
+
 Disk persistence remains out of scope.
 """
 
@@ -108,6 +149,7 @@ from . import __version__
 
 SNAPSHOT_FORMAT_VERSION = 1
 SNAPSHOT_FORMAT_VERSION_JOIN = 2
+SNAPSHOT_FORMAT_VERSION_CHANGES = 3
 
 
 class StreamExistsError(Exception):
@@ -132,6 +174,18 @@ class LookupKeyNotFoundError(Exception):
 
 class JoinNotEnabledError(Exception):
     """Raised when querying joined results on a plain stream."""
+
+
+class ChangeFeedNotEnabledError(Exception):
+    """Raised when reading changes on a stream without a change feed."""
+
+
+class ChangeCursorAheadError(Exception):
+    """Raised when a change cursor is beyond the stream's latest_seq."""
+
+
+class ChangeCursorExpiredError(Exception):
+    """Raised when a change cursor fell behind the retained records."""
 
 
 class WatermarkRegressionError(Exception):
@@ -174,6 +228,7 @@ class _Stream:
         auto_watermark_lag_ms: int | None = None,
         slide_ms: int | None = None,
         lookup_table: str | None = None,
+        change_retention: int | None = None,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
@@ -185,6 +240,13 @@ class _Stream:
         self.slide_ms = slide_ms
         # Name of the dimension table this stream joins against, if any.
         self.lookup_table = lookup_table
+        # Maximum number of retained change-feed records; None disables
+        # the feed entirely.
+        self.change_retention = change_retention
+        # Last published change sequence number (never regresses) and the
+        # retained records, ascending by seq.
+        self._latest_seq = 0
+        self._changes: list[dict] = []
         self.watermark: int | None = None
         # Maximum timestamp_ms of a successfully accepted event; only
         # maintained on automatic streams, None until the first such event.
@@ -329,6 +391,34 @@ class _Stream:
                 group = groups.setdefault((lookup_key, label), [0, 0])
                 group[0] += 1
                 group[1] += value
+            # Base-window upsert with the post-aggregation totals; the
+            # loop order keeps sliding events ascending by window start.
+            self._publish_change("upsert", start, bucket[0], bucket[1])
+        self._trim_changes()
+
+    def _publish_change(self, kind: str, start: int, count: int, total: float) -> None:
+        """Append one change record with the next sequence number."""
+        if self.change_retention is None:
+            return
+        self._latest_seq += 1
+        self._changes.append(
+            {
+                "seq": self._latest_seq,
+                "kind": kind,
+                "window_start_ms": start,
+                "window_end_ms": start + self.window_ms,
+                "count": count,
+                "sum": total,
+            }
+        )
+
+    def _trim_changes(self) -> None:
+        """Drop the oldest records beyond the configured retention."""
+        if self.change_retention is None:
+            return
+        excess = len(self._changes) - self.change_retention
+        if excess > 0:
+            del self._changes[:excess]
 
     def advance_watermark(self, watermark_ms: int) -> list[dict]:
         if self.watermark is not None and watermark_ms < self.watermark:
@@ -353,6 +443,10 @@ class _Stream:
                     }
                 )
                 self._finalized_starts.add(start)
+                # The window's terminal record; manual advances publish
+                # only these, automatic ones publish them after the
+                # event's own upserts.
+                self._publish_change("final", start, count, total)
                 if self.lookup_table is not None:
                     # Joined groups finalize synchronously with their window,
                     # ordered by (lookup_key, label) within it.
@@ -371,6 +465,7 @@ class _Stream:
                             }
                         )
         self._finalized.extend(newly)
+        self._trim_changes()
         if self.dedup_retention_ms is not None:
             horizon = watermark_ms - self.dedup_retention_ms
             self._dedup = {
@@ -448,11 +543,21 @@ class _Stream:
                     record["lookup_key"] = kept[2]
                 records.append(record)
             entry["dedup_records"] = records
+        if self.change_retention is not None:
+            # Change-feed streams publish the retention, the cursor and
+            # the retained records; only format_version 3 documents may
+            # carry these.
+            entry["change_retention"] = self.change_retention
+            entry["latest_seq"] = self._latest_seq
+            entry["changes"] = [dict(record) for record in self._changes]
         return entry
 
     @classmethod
     def from_snapshot(
-        cls, data: object, table_names: set[str] | None = None
+        cls,
+        data: object,
+        table_names: set[str] | None = None,
+        allow_changes: bool = False,
     ) -> "_Stream":
         """Rebuild one stream from a snapshot entry or raise SnapshotError.
 
@@ -460,7 +565,10 @@ class _Stream:
         repaired: callers get a fully formed stream or nothing. Join
         fields (``lookup_table``, ``joined_windows``, ``joined_finalized``)
         are only accepted when ``table_names`` is given (a version 2
-        document); the referenced table must be one of them.
+        document); the referenced table must be one of them. Change-feed
+        fields (``change_retention``, ``latest_seq``, ``changes``) are
+        only accepted when ``allow_changes`` is set (a version 3
+        document).
         """
         if not isinstance(data, dict):
             raise SnapshotError("stream entry must be an object")
@@ -479,6 +587,8 @@ class _Stream:
         }
         if table_names is not None:
             allowed |= {"lookup_table", "joined_windows", "joined_finalized"}
+        if allow_changes:
+            allowed |= {"change_retention", "latest_seq", "changes"}
         extra = sorted(set(data) - allowed)
         if extra:
             raise SnapshotError(f"stream entry has unexpected field: {extra[0]}")
@@ -581,6 +691,26 @@ class _Stream:
                         f"stream {name!r}: {field} present without lookup_table"
                     )
 
+        # The change-feed triple must appear together; a document without
+        # it restores as a stream with the feed disabled.
+        change_fields = {"change_retention", "latest_seq", "changes"}
+        present = change_fields & set(data)
+        if present and present != change_fields:
+            raise SnapshotError(
+                "stream entry change-feed fields must appear together: "
+                "change_retention, latest_seq and changes"
+            )
+        change_retention = data.get("change_retention") if present else None
+        if present:
+            if not _is_int(change_retention) or change_retention <= 0:
+                raise SnapshotError(
+                    f"stream {name!r}: change_retention must be a positive integer"
+                )
+            if not _is_int(data["latest_seq"]) or data["latest_seq"] < 0:
+                raise SnapshotError(
+                    f"stream {name!r}: latest_seq must be a non-negative integer"
+                )
+
         stream = cls(
             name,
             window_ms,
@@ -589,6 +719,7 @@ class _Stream:
             auto_lag,
             slide_ms,
             lookup_table,
+            change_retention,
         )
         stream.watermark = watermark
         stream.max_event_timestamp = max_event_timestamp
@@ -680,6 +811,8 @@ class _Stream:
                     f"max_event_timestamp_ms - auto_watermark_lag_ms "
                     f"({max_event_timestamp - auto_lag})"
                 )
+        if change_retention is not None:
+            stream._load_change_records(data["changes"], data["latest_seq"])
         return stream
 
     @staticmethod
@@ -1020,6 +1153,137 @@ class _Stream:
                     f"({retained}) than aggregated events ({total})"
                 )
 
+    def _load_change_records(self, records: object, latest_seq: int) -> None:
+        """Load retained change records and check them against the windows.
+
+        The retained records are always the most recent ones: a strictly
+        ordered, gap-free suffix of the sequence ending at ``latest_seq``,
+        no longer than ``change_retention``. Each record's window must be
+        aligned to the stream's grid, and each window's last retained
+        record must match the aggregate state — an ``upsert`` equal to
+        the open window's totals, or a ``final`` equal to the finalized
+        row.
+        """
+        name = self.name
+        assert self.change_retention is not None
+        if not isinstance(records, list):
+            raise SnapshotError(f"stream {name!r}: changes must be an array")
+        if len(records) > self.change_retention:
+            raise SnapshotError(
+                f"stream {name!r}: changes exceed the change_retention limit "
+                f"of {self.change_retention}"
+            )
+        fields = {"seq", "kind", "window_start_ms", "window_end_ms", "count", "sum"}
+        parsed: list[dict] = []
+        for raw in records:
+            if not isinstance(raw, dict):
+                raise SnapshotError(
+                    f"stream {name!r}: changes entries must be objects"
+                )
+            extra = sorted(set(raw) - fields)
+            if extra:
+                raise SnapshotError(
+                    f"stream {name!r}: change record has unexpected field: {extra[0]}"
+                )
+            missing = sorted(fields - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"stream {name!r}: change record missing field: {missing[0]}"
+                )
+            seq = raw["seq"]
+            kind = raw["kind"]
+            start = raw["window_start_ms"]
+            end = raw["window_end_ms"]
+            count = raw["count"]
+            total = raw["sum"]
+            if not _is_int(seq) or seq <= 0:
+                raise SnapshotError(
+                    f"stream {name!r}: change record seq must be a positive integer"
+                )
+            if kind not in ("upsert", "final"):
+                raise SnapshotError(
+                    f"stream {name!r}: change record kind must be upsert or final"
+                )
+            if not _is_int(start):
+                raise SnapshotError(
+                    f"stream {name!r}: change record window_start_ms must be an "
+                    f"integer"
+                )
+            if start % self._step_ms != 0:
+                raise SnapshotError(
+                    f"stream {name!r}: change record window {start} is not "
+                    f"aligned to the window grid step {self._step_ms}"
+                )
+            if not _is_int(end) or end != start + self.window_ms:
+                raise SnapshotError(
+                    f"stream {name!r}: change record window {start} end must be "
+                    f"{start + self.window_ms}"
+                )
+            if not _is_int(count) or count <= 0:
+                raise SnapshotError(
+                    f"stream {name!r}: change record count must be a positive "
+                    f"integer"
+                )
+            if not _is_finite_number(total):
+                raise SnapshotError(
+                    f"stream {name!r}: change record sum must be a finite number"
+                )
+            parsed.append(dict(raw))
+        if not parsed and latest_seq > 0:
+            raise SnapshotError(
+                f"stream {name!r}: latest_seq {latest_seq} requires retained "
+                f"change records"
+            )
+        # Trimming only ever drops records beyond the retention cap, so a
+        # consistent feed retains exactly min(latest_seq, retention)
+        # records: the consecutive suffix ending at latest_seq.
+        if len(parsed) != min(latest_seq, self.change_retention):
+            raise SnapshotError(
+                f"stream {name!r}: {len(parsed)} retained change records is "
+                f"inconsistent with latest_seq {latest_seq} and "
+                f"change_retention {self.change_retention}"
+            )
+        first_seq = latest_seq - len(parsed) + 1
+        for index, record in enumerate(parsed):
+            if record["seq"] != first_seq + index:
+                raise SnapshotError(
+                    f"stream {name!r}: changes must be strictly ordered and "
+                    f"consecutive, ending at latest_seq {latest_seq}"
+                )
+        last_by_window: dict[int, dict] = {}
+        for record in parsed:
+            last_by_window[record["window_start_ms"]] = record
+        finalized_by_start = {
+            row["window_start_ms"]: row for row in self._finalized
+        }
+        for start, record in last_by_window.items():
+            if start in self._windows:
+                count, total = self._windows[start]
+                kind = "upsert"
+                state: tuple = (count, total)
+            elif start in finalized_by_start:
+                row = finalized_by_start[start]
+                kind = "final"
+                state = (row["count"], row["sum"])
+            else:
+                raise SnapshotError(
+                    f"stream {name!r}: change record references unknown window "
+                    f"{start}"
+                )
+            if (
+                record["kind"] != kind
+                or record["count"] != state[0]
+                or not math.isclose(
+                    record["sum"], state[1], rel_tol=1e-9, abs_tol=1e-9
+                )
+            ):
+                raise SnapshotError(
+                    f"stream {name!r}: last retained change for window {start} "
+                    f"does not match the aggregate state"
+                )
+        self._latest_seq = latest_seq
+        self._changes = parsed
+
 
 class Service:
     """StreamMill service: health reporting plus windowed event aggregation."""
@@ -1061,6 +1325,7 @@ class Service:
         auto_watermark_lag_ms: int | None = None,
         slide_ms: int | None = None,
         lookup_table: str | None = None,
+        change_retention: int | None = None,
     ) -> dict:
         with self._lock:
             if name in self._streams:
@@ -1075,6 +1340,7 @@ class Service:
                 auto_watermark_lag_ms,
                 slide_ms,
                 lookup_table,
+                change_retention,
             )
         payload = {
             "stream": name,
@@ -1089,6 +1355,8 @@ class Service:
             payload["slide_ms"] = slide_ms
         if lookup_table is not None:
             payload["lookup_table"] = lookup_table
+        if change_retention is not None:
+            payload["change_retention"] = change_retention
         return payload
 
     def stream_features(self, name: str) -> dict | None:
@@ -1145,38 +1413,79 @@ class Service:
             rows = [dict(row) for row in stream._joined_finalized]
         return {"stream": name, "results": rows}
 
+    def changes(self, name: str, after_seq: int, limit: int) -> dict:
+        """Read retained change records with ``seq > after_seq``.
+
+        The read happens under the service lock, so it always observes a
+        complete commit: a consistent (latest_seq, records) pair.
+        """
+        with self._lock:
+            stream = self._get(name)
+            if stream.change_retention is None:
+                raise ChangeFeedNotEnabledError(name)
+            if after_seq > stream._latest_seq:
+                raise ChangeCursorAheadError(
+                    f"after_seq {after_seq} is ahead of latest_seq "
+                    f"{stream._latest_seq}"
+                )
+            retained = stream._changes
+            if retained and after_seq < retained[0]["seq"] - 1:
+                raise ChangeCursorExpiredError(
+                    f"after_seq {after_seq} is behind the earliest retained "
+                    f"seq {retained[0]['seq']}"
+                )
+            records = [
+                dict(record) for record in retained if record["seq"] > after_seq
+            ][:limit]
+            latest_seq = stream._latest_seq
+        return {"stream": name, "latest_seq": latest_seq, "changes": records}
+
     def snapshot(self) -> dict:
         """Return a consistent point-in-time, JSON-serializable snapshot.
 
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
-        included or fully excluded. Instances with dimension tables export
-        ``format_version`` 2 (tables plus joined-stream state); without any
-        join state the document is the unchanged version 1 shape.
+        included or fully excluded. Instances with a change-feed stream
+        export ``format_version`` 3 (the version 2 shape plus the feed
+        state); otherwise instances with dimension tables export
+        ``format_version`` 2 and instances with neither keep the
+        unchanged version 1 shape.
         """
         with self._lock:
             streams = [
                 self._streams[name].to_snapshot() for name in sorted(self._streams)
             ]
+            if any(
+                stream.change_retention is not None
+                for stream in self._streams.values()
+            ):
+                return {
+                    "format_version": SNAPSHOT_FORMAT_VERSION_CHANGES,
+                    "tables": self._tables_snapshot(),
+                    "streams": streams,
+                }
             if self._tables:
                 return {
                     "format_version": SNAPSHOT_FORMAT_VERSION_JOIN,
-                    "tables": [
-                        {
-                            "name": table,
-                            "rows": [
-                                {"key": key, "label": self._tables[table][key]}
-                                for key in sorted(self._tables[table])
-                            ],
-                        }
-                        for table in sorted(self._tables)
-                    ],
+                    "tables": self._tables_snapshot(),
                     "streams": streams,
                 }
             return {
                 "format_version": SNAPSHOT_FORMAT_VERSION,
                 "streams": streams,
             }
+
+    def _tables_snapshot(self) -> list[dict]:
+        return [
+            {
+                "name": table,
+                "rows": [
+                    {"key": key, "label": self._tables[table][key]}
+                    for key in sorted(self._tables[table])
+                ],
+            }
+            for table in sorted(self._tables)
+        ]
 
     def restore_snapshot(self, document: object) -> int:
         """Replace instance state with a validated snapshot, atomically.
@@ -1186,8 +1495,9 @@ class Service:
         invalid document raises SnapshotError and leaves the (empty)
         instance untouched. Version 1 documents restore as before;
         version 2 documents additionally restore dimension tables and
-        joined-stream state under strict validation. Returns the restored
-        stream count.
+        joined-stream state under strict validation; version 3 documents
+        are the version 2 shape plus strictly validated change-feed
+        state. Returns the restored stream count.
         """
         with self._lock:
             # Conflict takes priority over every content check: an instance
@@ -1208,7 +1518,10 @@ class Service:
                 raise SnapshotError("format_version must be an integer")
             if version == SNAPSHOT_FORMAT_VERSION:
                 allowed = {"format_version", "streams"}
-            elif version == SNAPSHOT_FORMAT_VERSION_JOIN:
+            elif version in (
+                SNAPSHOT_FORMAT_VERSION_JOIN,
+                SNAPSHOT_FORMAT_VERSION_CHANGES,
+            ):
                 allowed = {"format_version", "streams", "tables"}
             else:
                 raise SnapshotError(f"unsupported format_version: {version}")
@@ -1227,7 +1540,7 @@ class Service:
                 raise SnapshotError("streams must be an array")
 
             tables: dict[str, dict[str, str]] = {}
-            if version == SNAPSHOT_FORMAT_VERSION_JOIN:
+            if version != SNAPSHOT_FORMAT_VERSION:
                 tables = self._parse_tables(document["tables"])
 
             # Build and validate everything before the single publishing
@@ -1239,8 +1552,9 @@ class Service:
                 stream = _Stream.from_snapshot(
                     entry,
                     table_names=set(tables)
-                    if version == SNAPSHOT_FORMAT_VERSION_JOIN
+                    if version != SNAPSHOT_FORMAT_VERSION
                     else None,
+                    allow_changes=version == SNAPSHOT_FORMAT_VERSION_CHANGES,
                 )
                 if stream.name in restored:
                     raise SnapshotError(
@@ -1256,7 +1570,7 @@ class Service:
 
     @staticmethod
     def _parse_tables(value: object) -> dict[str, dict[str, str]]:
-        """Validate the ``tables`` array of a version 2 snapshot."""
+        """Validate the ``tables`` array of a version 2 or 3 snapshot."""
         if not isinstance(value, list):
             raise SnapshotError("tables must be an array")
         tables: dict[str, dict[str, str]] = {}

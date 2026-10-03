@@ -49,7 +49,7 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - `GET /snapshot` 返回一致时点的全量状态文档 `{"format_version": 1, "streams": [...]}`。导出在同一把状态锁内完成，期间的创建流、提交事件与推进水位线要么整体包含、要么整体不包含；普通接口不产生任何落盘副作用。
 - `streams` 按流名升序。每个流对象包含 `name`、`window_ms`、`allowed_lateness_ms`、`dedup_retention_ms`（未启用去重时为 `null`，且无 `dedup_records`）、`watermark_ms`（未推进时为 `null`）、尚未最终关闭的 `windows`、已经最终化的 `finalized`；启用去重时还包含保留期内的 `dedup_records`（`event_id`、`timestamp_ms`、`value`）。自动流额外包含成对出现的 `auto_watermark_lag_ms` 与 `max_event_timestamp_ms`（尚无成功接收事件时后者为 `null`）；不含这两个字段的文档按手工流恢复。滑动流额外包含 `slide_ms`；不含该字段的旧文档按滚动窗口恢复。`windows` 与 `finalized` 的窗口对象为 `window_start_ms`、`window_end_ms`、`count`、`sum`，`finalized` 行另含 `stream`；两个数组均按 `window_start_ms` 升序（滑动流按 `slide_ms` 网格对齐），`dedup_records` 按 `event_id` 升序。
 - `POST /snapshot/restore` 仅允许在尚未创建任何流的实例上调用，成功返回 200 `{"restored_streams": N}` 并一次性发布全部状态，其他请求不会观察到部分流；空快照 `{"format_version": 1, "streams": []}` 合法并返回零。恢复后结果查询与导出前一致，开放窗口可继续接收合规事件并在后续水位线下正确最终化，已最终化窗口不会再次进入 `finalized`，保留的标识继续执行重复/冲突判断且淘汰边界不变；自动流恢复后的自动推进、去重与最终结果与导出前一致；滑动流恢复后的继续写入（事件计入全部重叠窗口）、去重淘汰、手工或自动推进及再次导出与未中断实例等价；无写入的再次导出在语义与数组顺序上完全相同。
-- 恢复严格校验且不静默修正：请求体不是合法 JSON 返回 400 `invalid_json`；对象结构、字段类型、`format_version`（支持 1 与 2，其他版本同样拒绝）、流名唯一性与升序、配置约束（含 `dedup_retention_ms >= allowed_lateness_ms`，以及滑动流的 `slide_ms` 为正整数、不大于 `window_ms` 且整除 `window_ms`）、数组排序、窗口宽度、起点与网格步长对齐、窗口开闭关系、最终结果与水位线/迟到配置的关系、重复窗口或重复 `event_id`、去重记录的保留期边界与所属各窗口计数关系任一不合法，均返回 422 `invalid_snapshot`，实例保持完全为空。自动流的两个字段必须成对出现且类型合法（`auto_watermark_lag_ms` 为非负整数，`max_event_timestamp_ms` 为整数或 `null`）；非空最大事件时间聚合到的每个窗口都必须是已有开放或最终窗口，且水位线不得低于最大事件时间减去滞后量。实例中已存在任意流时，对任何可解析的快照文档都返回 409 `restore_conflict`（请求体本身不是合法 JSON 时仍按请求格式错误返回 400 `invalid_json`），原状态不变。健康检查、手工流、滑动/滚动流间隔离以及其他既有错误优先级均不改变。
+- 恢复严格校验且不静默修正：请求体不是合法 JSON 返回 400 `invalid_json`；对象结构、字段类型、`format_version`（支持 1、2 与 3，其他版本同样拒绝）、流名唯一性与升序、配置约束（含 `dedup_retention_ms >= allowed_lateness_ms`，以及滑动流的 `slide_ms` 为正整数、不大于 `window_ms` 且整除 `window_ms`）、数组排序、窗口宽度、起点与网格步长对齐、窗口开闭关系、最终结果与水位线/迟到配置的关系、重复窗口或重复 `event_id`、去重记录的保留期边界与所属各窗口计数关系任一不合法，均返回 422 `invalid_snapshot`，实例保持完全为空。自动流的两个字段必须成对出现且类型合法（`auto_watermark_lag_ms` 为非负整数，`max_event_timestamp_ms` 为整数或 `null`）；非空最大事件时间聚合到的每个窗口都必须是已有开放或最终窗口，且水位线不得低于最大事件时间减去滞后量。实例中已存在任意流时，对任何可解析的快照文档都返回 409 `restore_conflict`（请求体本身不是合法 JSON 时仍按请求格式错误返回 400 `invalid_json`），原状态不变。健康检查、手工流、滑动/滚动流间隔离以及其他既有错误优先级均不改变。
 
 ## 进程内维表与可选当前值连接
 
@@ -59,6 +59,14 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - 连接流的事件必须携带非空字符串 `lookup_key`（普通流仍将其视为未声明字段）。事件先按既有规则去重、判断迟到，再原子读取当前 `label`；键不存在返回 409 `lookup_key_not_found` 且状态不变。成功事件同时进入总量窗口与按 `(lookup_key, 当时 label)` 的分组聚合（`count`、`sum`）；改表仅影响后续事件。去重内容包含 `lookup_key`：同一 `event_id` 换键返回 409 `event_id_conflict`。滑动流计入全部重叠窗口，窗口关闭时同步最终化分组。
 - `GET /streams/{name}/joined-results` 仅返回最终分组（`stream`、`window_start_ms`、`window_end_ms`、`lookup_key`、`label`、`count`、`sum`），按窗口起点、`lookup_key`、`label` 升序；普通流返回 409 `join_not_enabled`，未知流返回 404 `stream_not_found`。
 - 存在任意维表时 `GET /snapshot` 导出 `format_version: 2`：`tables` 按名称、其行按 `key` 排序，连接流额外携带 `lookup_table`、`joined_windows`、`joined_finalized`（去重记录含 `lookup_key`）。恢复兼容 version 1，严格校验 version 2：未知表引用、重复或乱序键、分组与基础窗口不一致、非有限聚合值或错误排序均返回 422 `invalid_snapshot` 且不发布部分状态；已有流或表时返回 409 `restore_conflict`。未使用连接时，既有接口、错误优先级、响应与 version 1 快照不变。
+
+## 可选的窗口物化变更流
+
+- `POST /streams` 可额外携带 `change_retention`（正整数，限定最多保留的变更记录条数），提供时在创建响应中回显；不提供时不启用变更流，既有接口、响应与快照行为不变。
+- 启用后，`GET /streams/{name}/changes?after_seq=N&limit=L` 按游标读取窗口变更：`N` 为非负整数，`L` 为 1 至 1000；响应为 `{"stream", "latest_seq", "changes"}`，`changes` 按 `seq` 递增返回 `seq > N` 的保留记录，初始 `latest_seq` 为 0。参数缺失、重复、未知或越界返回 422 `invalid_request`；未知流返回 404 `stream_not_found`；未启用的流返回 409 `change_feed_not_enabled`；`N` 大于 `latest_seq` 返回 409 `change_cursor_ahead`；仍有保留记录且 `N` 小于最早保留 `seq` 减一时返回 410 `change_cursor_expired`。
+- `seq` 从 1 连续递增。成功聚合的事件为每个受影响的基础窗口产生一条 `kind: "upsert"` 记录（`seq`、`window_start_ms`、`window_end_ms` 与更新后的 `count`、`sum`），滑动窗口按起点递增产生多条；窗口最终化产生 `kind: "final"` 的终值记录——自动水位线触发时同一事件的全部 upsert 排在全部 final 之前，手工水位线只产生 final，没有新最终结果则不产生记录。精确重复、过迟丢弃、`event_id_conflict`、`lookup_key_not_found` 与校验失败都不消耗序号；连接流只发布基础窗口变更，分组结果不变。并发写入与聚合在同一把锁内提交，形成单一全序，读取只能看到完整提交。
+- 每次提交后裁掉最旧记录使保留数不超过 `change_retention`，`latest_seq` 不回退。
+- 存在任意启用变更流的流时 `GET /snapshot` 导出 `format_version: 3`：在 version 2 形状（`tables` 与连接状态）之上，启用流额外携带 `change_retention`、`latest_seq` 与保留的 `changes`。恢复严格校验序号连续性（保留记录是截至 `latest_seq` 的连续后缀，长度为 `min(latest_seq, change_retention)`）、保留上限、排序、窗口边界对齐，以及各窗口最后一条保留记录与聚合状态一致（开放窗口对应等值 upsert，最终窗口对应等值 final），任一不合法返回 422 `invalid_snapshot` 且不发布状态。恢复后游标与下一序号连续，与未中断实例等价；version 1 与 2 文档仍可恢复，未启用实例继续导出版本 1 或 2 的原形状。
 
 ## 验证
 

@@ -7,9 +7,12 @@ import json
 import math
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .service import (
+    ChangeCursorAheadError,
+    ChangeCursorExpiredError,
+    ChangeFeedNotEnabledError,
     EventIdConflictError,
     JoinNotEnabledError,
     LookupKeyNotFoundError,
@@ -68,6 +71,7 @@ _CREATE_OPTIONAL_FIELDS = {
     "auto_watermark_lag_ms": lambda v: _is_int(v) and v >= 0,
     "slide_ms": lambda v: _is_int(v) and v > 0,
     "lookup_table": lambda v: isinstance(v, str) and len(v) > 0,
+    "change_retention": lambda v: _is_int(v) and v > 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -167,6 +171,12 @@ class Handler(BaseHTTPRequestHandler):
             except JoinNotEnabledError:
                 self.send_error_json(409, "join_not_enabled", f"stream has no lookup_table: {segments[1]}")
             return
+        if len(segments) == 3 and segments[0] == "streams" and segments[2] == "changes":
+            try:
+                self._changes(segments[1])
+            except _RequestError as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
@@ -218,6 +228,7 @@ class Handler(BaseHTTPRequestHandler):
                 values.get("auto_watermark_lag_ms"),
                 slide,
                 values.get("lookup_table"),
+                values.get("change_retention"),
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
@@ -285,6 +296,47 @@ class Handler(BaseHTTPRequestHandler):
         except WatermarkRegressionError:
             raise _RequestError(409, "watermark_regression", "watermark must not move backwards") from None
         self.send_json(200, payload)
+
+    def _changes(self, name: str) -> None:
+        after_seq, limit = self._parse_changes_query()
+        try:
+            payload = self.service.changes(name, after_seq, limit)
+        except StreamNotFoundError:
+            raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
+        except ChangeFeedNotEnabledError:
+            raise _RequestError(
+                409, "change_feed_not_enabled", f"stream has no change feed: {name}"
+            ) from None
+        except ChangeCursorAheadError:
+            raise _RequestError(
+                409, "change_cursor_ahead", f"after_seq is ahead of latest_seq"
+            ) from None
+        except ChangeCursorExpiredError:
+            raise _RequestError(
+                410, "change_cursor_expired", f"after_seq fell behind the retained changes"
+            ) from None
+        self.send_json(200, payload)
+
+    def _parse_changes_query(self) -> tuple[int, int]:
+        """Validate the after_seq/limit query of a changes request."""
+        pairs = parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
+        keys = [key for key, _ in pairs]
+        if len(set(keys)) != len(keys):
+            raise _invalid_request("duplicate query parameter")
+        params = dict(pairs)
+        unknown = sorted(set(params) - {"after_seq", "limit"})
+        if unknown:
+            raise _invalid_request(f"unexpected query parameter: {unknown[0]}")
+        missing = sorted({"after_seq", "limit"} - set(params))
+        if missing:
+            raise _invalid_request(f"missing query parameter: {missing[0]}")
+        raw_after = params["after_seq"]
+        if not raw_after.isdigit():
+            raise _invalid_request("after_seq must be a non-negative integer")
+        raw_limit = params["limit"]
+        if not raw_limit.isdigit() or not 1 <= int(raw_limit) <= 1000:
+            raise _invalid_request("limit must be an integer between 1 and 1000")
+        return int(raw_after), int(raw_limit)
 
     def _restore_snapshot(self) -> None:
         document = self._read_json()
