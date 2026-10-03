@@ -77,6 +77,13 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - 成功批次保留 `batch_id`、请求与完整响应。保留期内以字段值与事件顺序相同的请求重试，原样返回首次响应且不再写入（重试不刷新保留顺序）；同一 `batch_id` 内容不同返回 409 `batch_id_conflict`。仅保留最近 `batch_retention` 条，淘汰后的标识可复用，并发同标识至多提交一次。
 - 存在任意批次流时 `GET /snapshot` 导出 `format_version: 4`（始终携带 `tables` 数组），对应流额外携带 `batch_retention` 与按提交顺序排列的 `batches` 记录（`batch_id`、`request`、`response`）。恢复兼容 version 1 至 3，并严格校验 version 4：重复标识、记录条数超过 `batch_retention`、请求或响应形状不合法均返回 422 `invalid_snapshot` 且不发布部分状态；恢复后重放与淘汰顺序和未中断实例一致。健康检查、单事件入口、水位线、结果查询、连接与变更流的既有行为不变。
 
+## 可选的事件时间版本维表
+
+- `POST /tables` 可额外携带 `event_time_versioned: true`（布尔值），声明该表为事件时间版本维表并在创建响应中回显；未声明（或为 `false`）时创建、覆盖写入与快照行为与当前值维表完全一致。类型或字段错误沿用 400 `invalid_json` 与 422 `invalid_request`。
+- 版本维表的 `POST /tables/{name}/rows` 接收 `{"key", "label", "effective_from_ms"}`：`effective_from_ms` 为整数，同一 `key` 的每个版本自其 `effective_from_ms` 生效到该键下一版本之前，写入允许乱序。首次写入或新增生效时间返回 `changed: true`；字段完全相同的重试返回 `changed: false`；同一 `(key, effective_from_ms)` 已存在但 `label` 不同返回 409 `dimension_version_conflict`，历史不变。当前值维表收到 `effective_from_ms` 视为未声明字段返回 422；未知表仍按基础形状先校验再返回 404 `table_not_found`。
+- `lookup_table` 引用版本维表的连接流中，每个事件以自身 `timestamp_ms` 选择不晚于该时间的最新版本参与分组聚合；键不存在或事件时间早于该键首个版本返回 409 `lookup_version_not_found`，聚合、去重、水位线、变更序号与批次均不变。之后补写的维度历史只影响事件时间不早于它的事件，不重算已接收事件。去重内容仍包含 `lookup_key`；批次中任一元素找不到版本时整批回滚，失败请求不占用 `batch_id`。
+- 只要存在版本维表，`GET /snapshot` 即导出 `format_version: 5`（始终携带 `tables` 数组）：版本维表对象携带 `event_time_versioned: true` 与 `versions`（`key`、`label`、`effective_from_ms`），版本点按 `key`、`effective_from_ms` 严格升序；当前值维表保持 `rows` 形状，流对象字段与 version 4 相同。恢复兼容 version 1 至 4，并严格校验 version 5：模式字段组合错误（`rows` 与版本标记混用、`versions` 缺少标记或标记非 `true`）、重复或乱序版本点、无效生效时间及同一点冲突均返回 422 `invalid_snapshot` 且不发布部分状态；恢复后按事件时间的连接解析、批次重放与变更游标与未中断实例一致。普通维表、未连接流、已有结果与 joined-results 排序、迟到与自动水位线规则、去重淘汰、变更流游标、批次重放、健康检查及既有错误优先级均保持不变。
+
 ## 验证
 
 ```bash
