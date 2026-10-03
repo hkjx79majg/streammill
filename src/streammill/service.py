@@ -71,7 +71,32 @@ Restore is only accepted on an instance
 without any streams, validates the document strictly (never silently
 repairing it) and publishes the whole state atomically.
 
-Joins and disk persistence remain out of scope.
+In-process dimension tables provide the lookup side of an optional
+current-value stream-table join:
+
+* ``POST /tables`` creates a named table; rows are written with
+  ``PUT``-style upserts of non-empty string ``key``/``label`` pairs and
+  report whether the stored label actually ``changed``;
+* a stream may be created with ``lookup_table`` naming an existing
+  table. Events on such a stream must carry a non-empty ``lookup_key``;
+  after the usual dedup and lateness decisions the current label is read
+  atomically (an unknown key is rejected with ``lookup_key_not_found``
+  and leaves all state untouched) and the event is aggregated both into
+  the plain windows and into per-window ``(lookup_key, label)`` groups.
+  Later table writes only affect later events. Dedup records on joined
+  streams include the ``lookup_key``, so resubmitting an id with a
+  different key is an ``event_id_conflict``;
+* joined groups finalize together with their window and are exposed
+  through ``Service.joined_results``, ordered by window start, lookup
+  key and label.
+
+Snapshots export as ``format_version`` 2 (adding ``tables`` plus
+``lookup_table``/``joined_windows``/``joined_finalized`` on joined
+streams) whenever any table exists, and restore stays compatible with
+version 1 documents. When the join is unused every public shape and the
+version 1 snapshot are unchanged.
+
+Disk persistence remains out of scope.
 """
 
 from __future__ import annotations
@@ -82,6 +107,7 @@ import threading
 from . import __version__
 
 SNAPSHOT_FORMAT_VERSION = 1
+SNAPSHOT_FORMAT_VERSION_JOIN = 2
 
 
 class StreamExistsError(Exception):
@@ -90,6 +116,22 @@ class StreamExistsError(Exception):
 
 class StreamNotFoundError(Exception):
     """Raised when addressing a stream that does not exist."""
+
+
+class TableExistsError(Exception):
+    """Raised when creating a table that already exists."""
+
+
+class TableNotFoundError(Exception):
+    """Raised when addressing a table that does not exist."""
+
+
+class LookupKeyNotFoundError(Exception):
+    """Raised when an event's lookup_key has no row in the table."""
+
+
+class JoinNotEnabledError(Exception):
+    """Raised when querying joined results on a plain stream."""
 
 
 class WatermarkRegressionError(Exception):
@@ -131,6 +173,7 @@ class _Stream:
         dedup_retention_ms: int | None = None,
         auto_watermark_lag_ms: int | None = None,
         slide_ms: int | None = None,
+        lookup_table: str | None = None,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
@@ -140,6 +183,8 @@ class _Stream:
         # None selects the tumbling grid (step == window_ms); otherwise the
         # stream is sliding with this fixed, evenly-dividing step.
         self.slide_ms = slide_ms
+        # Name of the dimension table this stream joins against, if any.
+        self.lookup_table = lookup_table
         self.watermark: int | None = None
         # Maximum timestamp_ms of a successfully accepted event; only
         # maintained on automatic streams, None until the first such event.
@@ -148,8 +193,14 @@ class _Stream:
         self._windows: dict[int, list] = {}
         self._finalized: list[dict] = []
         self._finalized_starts: set[int] = set()
-        # event_id -> (timestamp_ms, value) for accepted, not yet evicted ids.
-        self._dedup: dict[str, tuple[int, float]] = {}
+        # event_id -> (timestamp_ms, value) for accepted, not yet evicted
+        # ids; joined streams append the lookup_key to the tuple.
+        self._dedup: dict[str, tuple] = {}
+        # Joined streams only: window_start_ms -> (lookup_key, label) ->
+        # [count, sum] for open windows, plus the finalized group rows in
+        # results order (window start, lookup_key, label).
+        self._joined_windows: dict[int, dict[tuple[str, str], list]] = {}
+        self._joined_finalized: list[dict] = []
 
     @property
     def _step_ms(self) -> int:
@@ -170,7 +221,12 @@ class _Stream:
         return list(range(first, last + 1, step))
 
     def add_event(
-        self, timestamp_ms: int, value: float, event_id: str | None = None
+        self,
+        timestamp_ms: int,
+        value: float,
+        event_id: str | None = None,
+        lookup_key: str | None = None,
+        label_of=None,
     ) -> dict:
         """Process one event against the pre-event watermark.
 
@@ -181,12 +237,23 @@ class _Stream:
         nothing. Accepted-event bookkeeping (maximum event timestamp plus
         the resulting monotone watermark advance) only runs after
         aggregation and dedup registration.
+
+        On joined streams the current label for ``lookup_key`` is read
+        through ``label_of`` after the dedup and lateness decisions but
+        before any state mutation, so an unknown key raises
+        LookupKeyNotFoundError with all state untouched. The dedup check
+        includes the lookup key: an exact retry repeats timestamp, value
+        and key, while the same id with a different key conflicts.
         """
         automatic = self.auto_watermark_lag_ms is not None
+        joined = self.lookup_table is not None
         if self.dedup_retention_ms is not None:
             retained = self._dedup.get(event_id)
             if retained is not None:
-                if retained[0] == timestamp_ms and retained[1] == value:
+                same = retained[0] == timestamp_ms and retained[1] == value
+                if joined:
+                    same = same and retained[2] == lookup_key
+                if same:
                     outcome: dict = {"dropped": False, "duplicate": True}
                     if automatic:
                         outcome.update(watermark_ms=self.watermark, finalized=[])
@@ -198,8 +265,13 @@ class _Stream:
                 if automatic:
                     outcome.update(watermark_ms=self.watermark, finalized=[])
                 return outcome
-            self._aggregate(timestamp_ms, value)
-            self._dedup[event_id] = timestamp_ms, value
+            label = self._resolve_label(label_of, lookup_key)
+            self._aggregate(timestamp_ms, value, lookup_key, label)
+            self._dedup[event_id] = (
+                (timestamp_ms, value, lookup_key)
+                if joined
+                else (timestamp_ms, value)
+            )
             outcome = {"dropped": False, "duplicate": False}
         else:
             if self._is_too_late(timestamp_ms):
@@ -207,12 +279,19 @@ class _Stream:
                 if automatic:
                     outcome.update(watermark_ms=self.watermark, finalized=[])
                 return outcome
-            self._aggregate(timestamp_ms, value)
+            label = self._resolve_label(label_of, lookup_key)
+            self._aggregate(timestamp_ms, value, lookup_key, label)
             outcome = {"dropped": False}
         if automatic:
             newly = self._note_accepted_event(timestamp_ms)
             outcome.update(watermark_ms=self.watermark, finalized=newly)
         return outcome
+
+    def _resolve_label(self, label_of, lookup_key: str | None):
+        """Read the current label for a joined event, or None on plain streams."""
+        if self.lookup_table is None:
+            return None
+        return label_of(lookup_key)
 
     def _is_too_late(self, timestamp_ms: int) -> bool:
         return (
@@ -234,11 +313,22 @@ class _Stream:
             return self.advance_watermark(target)
         return []
 
-    def _aggregate(self, timestamp_ms: int, value: float) -> None:
+    def _aggregate(
+        self,
+        timestamp_ms: int,
+        value: float,
+        lookup_key: str | None = None,
+        label: str | None = None,
+    ) -> None:
         for start in self._window_starts(timestamp_ms):
             bucket = self._windows.setdefault(start, [0, 0])
             bucket[0] += 1
             bucket[1] += value
+            if self.lookup_table is not None:
+                groups = self._joined_windows.setdefault(start, {})
+                group = groups.setdefault((lookup_key, label), [0, 0])
+                group[0] += 1
+                group[1] += value
 
     def advance_watermark(self, watermark_ms: int) -> list[dict]:
         if self.watermark is not None and watermark_ms < self.watermark:
@@ -263,6 +353,23 @@ class _Stream:
                     }
                 )
                 self._finalized_starts.add(start)
+                if self.lookup_table is not None:
+                    # Joined groups finalize synchronously with their window,
+                    # ordered by (lookup_key, label) within it.
+                    groups = self._joined_windows.pop(start, {})
+                    for key, group_label in sorted(groups):
+                        group_count, group_sum = groups[(key, group_label)]
+                        self._joined_finalized.append(
+                            {
+                                "stream": self.name,
+                                "window_start_ms": start,
+                                "window_end_ms": end,
+                                "lookup_key": key,
+                                "label": group_label,
+                                "count": group_count,
+                                "sum": group_sum,
+                            }
+                        )
         self._finalized.extend(newly)
         if self.dedup_retention_ms is not None:
             horizon = watermark_ms - self.dedup_retention_ms
@@ -308,19 +415,52 @@ class _Stream:
             # Sliding streams publish the step; documents without it
             # restore as tumbling streams.
             entry["slide_ms"] = self.slide_ms
+        if self.lookup_table is not None:
+            # Joined streams publish the table reference plus the grouped
+            # state; only format_version 2 documents may carry these.
+            entry["lookup_table"] = self.lookup_table
+            joined_open = []
+            for start in sorted(self._joined_windows):
+                groups = self._joined_windows[start]
+                for key, group_label in sorted(groups):
+                    group_count, group_sum = groups[(key, group_label)]
+                    joined_open.append(
+                        {
+                            "window_start_ms": start,
+                            "window_end_ms": start + self.window_ms,
+                            "lookup_key": key,
+                            "label": group_label,
+                            "count": group_count,
+                            "sum": group_sum,
+                        }
+                    )
+            entry["joined_windows"] = joined_open
+            entry["joined_finalized"] = [dict(row) for row in self._joined_finalized]
         if self.dedup_retention_ms is not None:
-            entry["dedup_records"] = [
-                {"event_id": event_id, "timestamp_ms": kept[0], "value": kept[1]}
-                for event_id, kept in sorted(self._dedup.items())
-            ]
+            records = []
+            for event_id, kept in sorted(self._dedup.items()):
+                record = {
+                    "event_id": event_id,
+                    "timestamp_ms": kept[0],
+                    "value": kept[1],
+                }
+                if self.lookup_table is not None:
+                    record["lookup_key"] = kept[2]
+                records.append(record)
+            entry["dedup_records"] = records
         return entry
 
     @classmethod
-    def from_snapshot(cls, data: object) -> "_Stream":
+    def from_snapshot(
+        cls, data: object, table_names: set[str] | None = None
+    ) -> "_Stream":
         """Rebuild one stream from a snapshot entry or raise SnapshotError.
 
         Every structural and semantic rule is checked and nothing is
-        repaired: callers get a fully formed stream or nothing.
+        repaired: callers get a fully formed stream or nothing. Join
+        fields (``lookup_table``, ``joined_windows``, ``joined_finalized``)
+        are only accepted when ``table_names`` is given (a version 2
+        document); the referenced table must be one of them.
         """
         if not isinstance(data, dict):
             raise SnapshotError("stream entry must be an object")
@@ -337,6 +477,8 @@ class _Stream:
             "max_event_timestamp_ms",
             "slide_ms",
         }
+        if table_names is not None:
+            allowed |= {"lookup_table", "joined_windows", "joined_finalized"}
         extra = sorted(set(data) - allowed)
         if extra:
             raise SnapshotError(f"stream entry has unexpected field: {extra[0]}")
@@ -417,6 +559,28 @@ class _Stream:
                 f"non-null watermark"
             )
 
+        lookup_table = data.get("lookup_table")
+        if "lookup_table" in data:
+            if not isinstance(lookup_table, str) or not lookup_table:
+                raise SnapshotError(
+                    f"stream {name!r}: lookup_table must be a non-empty string"
+                )
+            if lookup_table not in table_names:
+                raise SnapshotError(
+                    f"stream {name!r}: unknown lookup_table {lookup_table!r}"
+                )
+            for field in ("joined_windows", "joined_finalized"):
+                if field not in data:
+                    raise SnapshotError(
+                        f"stream entry missing required field: {field}"
+                    )
+        else:
+            for field in ("joined_windows", "joined_finalized"):
+                if field in data:
+                    raise SnapshotError(
+                        f"stream {name!r}: {field} present without lookup_table"
+                    )
+
         stream = cls(
             name,
             window_ms,
@@ -424,6 +588,7 @@ class _Stream:
             retention,
             auto_lag,
             slide_ms,
+            lookup_table,
         )
         stream.watermark = watermark
         stream.max_event_timestamp = max_event_timestamp
@@ -475,9 +640,12 @@ class _Stream:
                 )
             stream._windows[start] = [row["count"], row["sum"]]
 
+        if lookup_table is not None:
+            cls._load_joined_state(stream, data, name, window_ms)
+
         if retention is not None:
             records = data.get("dedup_records")
-            stream._load_dedup_records(records)
+            stream._load_dedup_records(records, joined=lookup_table is not None)
         elif "dedup_records" in data:
             raise SnapshotError(
                 f"stream {name!r}: dedup_records present without dedup_retention_ms"
@@ -587,7 +755,186 @@ class _Stream:
             rows.append(raw)
         return rows
 
-    def _load_dedup_records(self, records: object) -> None:
+    @staticmethod
+    def _parse_joined_list(
+        value: object,
+        name: str,
+        window_ms: int,
+        where: str,
+        *,
+        with_stream: bool,
+        step_ms: int,
+    ) -> list[dict]:
+        """Validate one joined-group array of a version 2 snapshot entry."""
+        if not isinstance(value, list):
+            raise SnapshotError(f"stream {name!r}: {where} must be an array")
+        fields = {
+            "window_start_ms",
+            "window_end_ms",
+            "lookup_key",
+            "label",
+            "count",
+            "sum",
+        }
+        if with_stream:
+            fields |= {"stream"}
+        rows: list[dict] = []
+        previous: tuple | None = None
+        for raw in value:
+            if not isinstance(raw, dict):
+                raise SnapshotError(f"stream {name!r}: {where} entries must be objects")
+            extra = sorted(set(raw) - fields)
+            if extra:
+                raise SnapshotError(
+                    f"stream {name!r}: {where} entry has unexpected field: {extra[0]}"
+                )
+            missing = sorted(fields - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"stream {name!r}: {where} entry missing field: {missing[0]}"
+                )
+            start = raw["window_start_ms"]
+            end = raw["window_end_ms"]
+            lookup_key = raw["lookup_key"]
+            label = raw["label"]
+            count = raw["count"]
+            total = raw["sum"]
+            if not _is_int(start):
+                raise SnapshotError(
+                    f"stream {name!r}: {where} window_start_ms must be an integer"
+                )
+            if start % step_ms != 0:
+                raise SnapshotError(
+                    f"stream {name!r}: window {start} is not aligned to the "
+                    f"window grid step {step_ms}"
+                )
+            if not _is_int(end) or end != start + window_ms:
+                raise SnapshotError(
+                    f"stream {name!r}: window {start} end must be {start + window_ms}"
+                )
+            if not isinstance(lookup_key, str) or not lookup_key:
+                raise SnapshotError(
+                    f"stream {name!r}: {where} lookup_key must be a non-empty string"
+                )
+            if not isinstance(label, str) or not label:
+                raise SnapshotError(
+                    f"stream {name!r}: {where} label must be a non-empty string"
+                )
+            if not _is_int(count) or count <= 0:
+                raise SnapshotError(
+                    f"stream {name!r}: window {start} count must be a positive integer"
+                )
+            if not _is_finite_number(total):
+                raise SnapshotError(
+                    f"stream {name!r}: window {start} sum must be a finite number"
+                )
+            if with_stream and (
+                not isinstance(raw["stream"], str) or not raw["stream"]
+            ):
+                raise SnapshotError(
+                    f"stream {name!r}: joined_finalized row stream must be a "
+                    f"non-empty string"
+                )
+            order_key = (start, lookup_key, label)
+            if previous is not None and order_key <= previous:
+                raise SnapshotError(
+                    f"stream {name!r}: {where} must be strictly ordered by "
+                    f"window_start_ms, lookup_key, label"
+                )
+            previous = order_key
+            rows.append(raw)
+        return rows
+
+    @classmethod
+    def _load_joined_state(
+        cls, stream: "_Stream", data: dict, name: str, window_ms: int
+    ) -> None:
+        """Load joined groups and check them against the base windows.
+
+        The joined groups must partition the plain window aggregates
+        exactly: every open or finalized base window has groups, and the
+        per-window group counts and sums add up to the base totals.
+        """
+        open_rows = cls._parse_joined_list(
+            data["joined_windows"],
+            name,
+            window_ms,
+            "joined_windows",
+            with_stream=False,
+            step_ms=stream._step_ms,
+        )
+        for row in open_rows:
+            start = row["window_start_ms"]
+            groups = stream._joined_windows.setdefault(start, {})
+            groups[(row["lookup_key"], row["label"])] = [row["count"], row["sum"]]
+
+        finalized_rows = cls._parse_joined_list(
+            data["joined_finalized"],
+            name,
+            window_ms,
+            "joined_finalized",
+            with_stream=True,
+            step_ms=stream._step_ms,
+        )
+        for row in finalized_rows:
+            if row["stream"] != name:
+                raise SnapshotError(
+                    f"stream {name!r}: joined_finalized row labels stream "
+                    f"{row['stream']!r}"
+                )
+            stream._joined_finalized.append(dict(row))
+
+        if set(stream._joined_windows) != set(stream._windows):
+            raise SnapshotError(
+                f"stream {name!r}: joined_windows do not match the open windows"
+            )
+        for start, groups in stream._joined_windows.items():
+            cls._check_group_totals(
+                name,
+                start,
+                sum(group[0] for group in groups.values()),
+                sum(group[1] for group in groups.values()),
+                stream._windows[start],
+            )
+
+        finalized_by_start = {
+            row["window_start_ms"]: row for row in stream._finalized
+        }
+        joined_finalized_starts = {
+            row["window_start_ms"] for row in stream._joined_finalized
+        }
+        if joined_finalized_starts != stream._finalized_starts:
+            raise SnapshotError(
+                f"stream {name!r}: joined_finalized do not match the finalized "
+                f"windows"
+            )
+        grouped: dict[int, list[dict]] = {}
+        for row in stream._joined_finalized:
+            grouped.setdefault(row["window_start_ms"], []).append(row)
+        for start, rows in grouped.items():
+            base = finalized_by_start[start]
+            cls._check_group_totals(
+                name,
+                start,
+                sum(row["count"] for row in rows),
+                sum(row["sum"] for row in rows),
+                (base["count"], base["sum"]),
+            )
+
+    @staticmethod
+    def _check_group_totals(
+        name: str, start: int, count: int, total: float, base: tuple
+    ) -> None:
+        base_count, base_sum = base
+        if count != base_count or not math.isclose(
+            total, base_sum, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            raise SnapshotError(
+                f"stream {name!r}: joined groups of window {start} do not add "
+                f"up to the base window aggregates"
+            )
+
+    def _load_dedup_records(self, records: object, *, joined: bool = False) -> None:
         if not isinstance(records, list):
             raise SnapshotError(f"stream {self.name!r}: dedup_records must be an array")
         assert self.dedup_retention_ms is not None
@@ -600,6 +947,8 @@ class _Stream:
                     f"stream {self.name!r}: dedup_records entries must be objects"
                 )
             fields = {"event_id", "timestamp_ms", "value"}
+            if joined:
+                fields |= {"lookup_key"}
             extra = sorted(set(raw) - fields)
             if extra:
                 raise SnapshotError(
@@ -625,6 +974,13 @@ class _Stream:
                 raise SnapshotError(
                     f"stream {self.name!r}: dedup record value must be a finite number"
                 )
+            if joined and (
+                not isinstance(raw["lookup_key"], str) or not raw["lookup_key"]
+            ):
+                raise SnapshotError(
+                    f"stream {self.name!r}: dedup record lookup_key must be a "
+                    f"non-empty string"
+                )
             if previous is not None and event_id <= previous:
                 raise SnapshotError(
                     f"stream {self.name!r}: dedup_records must be strictly ordered by event_id"
@@ -645,7 +1001,11 @@ class _Stream:
                         f"into unknown window {start}"
                     )
                 bucket_counts[start] = bucket_counts.get(start, 0) + 1
-            self._dedup[event_id] = (timestamp_ms, value)
+            self._dedup[event_id] = (
+                (timestamp_ms, value, raw["lookup_key"])
+                if joined
+                else (timestamp_ms, value)
+            )
         finalized_counts = {
             row["window_start_ms"]: row["count"] for row in self._finalized
         }
@@ -670,9 +1030,27 @@ class Service:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._streams: dict[str, _Stream] = {}
+        # table name -> {key: label}; in-process dimension tables.
+        self._tables: dict[str, dict[str, str]] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
+
+    def create_table(self, name: str) -> dict:
+        with self._lock:
+            if name in self._tables:
+                raise TableExistsError(name)
+            self._tables[name] = {}
+        return {"table": name}
+
+    def put_row(self, table: str, key: str, label: str) -> dict:
+        with self._lock:
+            rows = self._tables.get(table)
+            if rows is None:
+                raise TableNotFoundError(table)
+            changed = rows.get(key) != label
+            rows[key] = label
+        return {"table": table, "key": key, "label": label, "changed": changed}
 
     def create_stream(
         self,
@@ -682,10 +1060,13 @@ class Service:
         dedup_retention_ms: int | None = None,
         auto_watermark_lag_ms: int | None = None,
         slide_ms: int | None = None,
+        lookup_table: str | None = None,
     ) -> dict:
         with self._lock:
             if name in self._streams:
                 raise StreamExistsError(name)
+            if lookup_table is not None and lookup_table not in self._tables:
+                raise TableNotFoundError(lookup_table)
             self._streams[name] = _Stream(
                 name,
                 window_ms,
@@ -693,6 +1074,7 @@ class Service:
                 dedup_retention_ms,
                 auto_watermark_lag_ms,
                 slide_ms,
+                lookup_table,
             )
         payload = {
             "stream": name,
@@ -705,19 +1087,44 @@ class Service:
             payload["auto_watermark_lag_ms"] = auto_watermark_lag_ms
         if slide_ms is not None:
             payload["slide_ms"] = slide_ms
+        if lookup_table is not None:
+            payload["lookup_table"] = lookup_table
         return payload
 
-    def dedup_enabled(self, name: str) -> bool | None:
-        """Whether the stream deduplicates; None if the stream is unknown."""
+    def stream_features(self, name: str) -> dict | None:
+        """Event-surface features of the stream; None if it is unknown."""
         with self._lock:
             stream = self._streams.get(name)
-            return None if stream is None else stream.dedup_retention_ms is not None
+            if stream is None:
+                return None
+            return {
+                "dedup": stream.dedup_retention_ms is not None,
+                "join": stream.lookup_table is not None,
+            }
 
     def add_event(
-        self, name: str, timestamp_ms: int, value: float, event_id: str | None = None
+        self,
+        name: str,
+        timestamp_ms: int,
+        value: float,
+        event_id: str | None = None,
+        lookup_key: str | None = None,
     ) -> dict:
         with self._lock:
-            outcome = self._get(name).add_event(timestamp_ms, value, event_id)
+            stream = self._get(name)
+            label_of = None
+            if stream.lookup_table is not None:
+                rows = self._tables[stream.lookup_table]
+
+                def label_of(key: str, _rows=rows) -> str:
+                    try:
+                        return _rows[key]
+                    except KeyError:
+                        raise LookupKeyNotFoundError(key) from None
+
+            outcome = stream.add_event(
+                timestamp_ms, value, event_id, lookup_key, label_of
+            )
         return {"stream": name, **outcome}
 
     def advance_watermark(self, name: str, watermark_ms: int) -> dict:
@@ -730,56 +1137,98 @@ class Service:
             rows = self._get(name).results()
         return {"stream": name, "results": rows}
 
+    def joined_results(self, name: str) -> dict:
+        with self._lock:
+            stream = self._get(name)
+            if stream.lookup_table is None:
+                raise JoinNotEnabledError(name)
+            rows = [dict(row) for row in stream._joined_finalized]
+        return {"stream": name, "results": rows}
+
     def snapshot(self) -> dict:
         """Return a consistent point-in-time, JSON-serializable snapshot.
 
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
-        included or fully excluded.
+        included or fully excluded. Instances with dimension tables export
+        ``format_version`` 2 (tables plus joined-stream state); without any
+        join state the document is the unchanged version 1 shape.
         """
         with self._lock:
+            streams = [
+                self._streams[name].to_snapshot() for name in sorted(self._streams)
+            ]
+            if self._tables:
+                return {
+                    "format_version": SNAPSHOT_FORMAT_VERSION_JOIN,
+                    "tables": [
+                        {
+                            "name": table,
+                            "rows": [
+                                {"key": key, "label": self._tables[table][key]}
+                                for key in sorted(self._tables[table])
+                            ],
+                        }
+                        for table in sorted(self._tables)
+                    ],
+                    "streams": streams,
+                }
             return {
                 "format_version": SNAPSHOT_FORMAT_VERSION,
-                "streams": [
-                    self._streams[name].to_snapshot() for name in sorted(self._streams)
-                ],
+                "streams": streams,
             }
 
     def restore_snapshot(self, document: object) -> int:
         """Replace instance state with a validated snapshot, atomically.
 
-        Only callable on an instance without streams; otherwise raises
-        RestoreConflictError, regardless of document content. Any invalid
-        document raises SnapshotError and leaves the (empty) instance
-        untouched. Returns the restored stream count.
+        Only callable on an instance without streams or tables; otherwise
+        raises RestoreConflictError, regardless of document content. Any
+        invalid document raises SnapshotError and leaves the (empty)
+        instance untouched. Version 1 documents restore as before;
+        version 2 documents additionally restore dimension tables and
+        joined-stream state under strict validation. Returns the restored
+        stream count.
         """
         with self._lock:
             # Conflict takes priority over every content check: an instance
-            # with streams always gets restore_conflict.
-            if self._streams:
+            # with streams or tables always gets restore_conflict.
+            if self._streams or self._tables:
                 raise RestoreConflictError(
-                    "restore is only allowed on an instance without streams"
+                    "restore is only allowed on an instance without streams "
+                    "or tables"
                 )
             if not isinstance(document, dict):
                 raise SnapshotError("snapshot document must be a JSON object")
-            if set(document) != {"format_version", "streams"}:
-                extra = sorted(set(document) - {"format_version", "streams"})
-                missing = sorted({"format_version", "streams"} - set(document))
-                if extra:
-                    raise SnapshotError(
-                        f"snapshot document has unexpected field: {extra[0]}"
-                    )
+            if "format_version" not in document:
                 raise SnapshotError(
-                    f"snapshot document missing required field: {missing[0]}"
+                    "snapshot document missing required field: format_version"
                 )
             version = document["format_version"]
             if not _is_int(version):
                 raise SnapshotError("format_version must be an integer")
-            if version != SNAPSHOT_FORMAT_VERSION:
+            if version == SNAPSHOT_FORMAT_VERSION:
+                allowed = {"format_version", "streams"}
+            elif version == SNAPSHOT_FORMAT_VERSION_JOIN:
+                allowed = {"format_version", "streams", "tables"}
+            else:
                 raise SnapshotError(f"unsupported format_version: {version}")
+            extra = sorted(set(document) - allowed)
+            if extra:
+                raise SnapshotError(
+                    f"snapshot document has unexpected field: {extra[0]}"
+                )
+            missing = sorted(allowed - set(document))
+            if missing:
+                raise SnapshotError(
+                    f"snapshot document missing required field: {missing[0]}"
+                )
             entries = document["streams"]
             if not isinstance(entries, list):
                 raise SnapshotError("streams must be an array")
+
+            tables: dict[str, dict[str, str]] = {}
+            if version == SNAPSHOT_FORMAT_VERSION_JOIN:
+                tables = self._parse_tables(document["tables"])
 
             # Build and validate everything before the single publishing
             # assignment, so a failure leaves no partial state and concurrent
@@ -787,7 +1236,12 @@ class Service:
             restored: dict[str, _Stream] = {}
             previous_name: str | None = None
             for entry in entries:
-                stream = _Stream.from_snapshot(entry)
+                stream = _Stream.from_snapshot(
+                    entry,
+                    table_names=set(tables)
+                    if version == SNAPSHOT_FORMAT_VERSION_JOIN
+                    else None,
+                )
                 if stream.name in restored:
                     raise SnapshotError(
                         f"duplicate stream name in snapshot: {stream.name!r}"
@@ -796,8 +1250,70 @@ class Service:
                     raise SnapshotError("streams must be strictly ordered by name")
                 previous_name = stream.name
                 restored[stream.name] = stream
+            self._tables = tables
             self._streams = restored
             return len(restored)
+
+    @staticmethod
+    def _parse_tables(value: object) -> dict[str, dict[str, str]]:
+        """Validate the ``tables`` array of a version 2 snapshot."""
+        if not isinstance(value, list):
+            raise SnapshotError("tables must be an array")
+        tables: dict[str, dict[str, str]] = {}
+        previous_name: str | None = None
+        for entry in value:
+            if not isinstance(entry, dict):
+                raise SnapshotError("table entries must be objects")
+            extra = sorted(set(entry) - {"name", "rows"})
+            if extra:
+                raise SnapshotError(f"table entry has unexpected field: {extra[0]}")
+            missing = sorted({"name", "rows"} - set(entry))
+            if missing:
+                raise SnapshotError(
+                    f"table entry missing required field: {missing[0]}"
+                )
+            name = entry["name"]
+            if not isinstance(name, str) or not name:
+                raise SnapshotError("table name must be a non-empty string")
+            if previous_name is not None and name <= previous_name:
+                raise SnapshotError("tables must be strictly ordered by name")
+            previous_name = name
+            raw_rows = entry["rows"]
+            if not isinstance(raw_rows, list):
+                raise SnapshotError(f"table {name!r}: rows must be an array")
+            rows: dict[str, str] = {}
+            previous_key: str | None = None
+            for raw in raw_rows:
+                if not isinstance(raw, dict):
+                    raise SnapshotError(f"table {name!r}: rows entries must be objects")
+                extra = sorted(set(raw) - {"key", "label"})
+                if extra:
+                    raise SnapshotError(
+                        f"table {name!r}: row has unexpected field: {extra[0]}"
+                    )
+                missing = sorted({"key", "label"} - set(raw))
+                if missing:
+                    raise SnapshotError(
+                        f"table {name!r}: row missing required field: {missing[0]}"
+                    )
+                key = raw["key"]
+                label = raw["label"]
+                if not isinstance(key, str) or not key:
+                    raise SnapshotError(
+                        f"table {name!r}: row key must be a non-empty string"
+                    )
+                if not isinstance(label, str) or not label:
+                    raise SnapshotError(
+                        f"table {name!r}: row label must be a non-empty string"
+                    )
+                if previous_key is not None and key <= previous_key:
+                    raise SnapshotError(
+                        f"table {name!r}: rows must be strictly ordered by key"
+                    )
+                previous_key = key
+                rows[key] = label
+            tables[name] = rows
+        return tables
 
     def _get(self, name: str) -> _Stream:
         try:

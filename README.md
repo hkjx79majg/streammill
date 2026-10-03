@@ -49,7 +49,16 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - `GET /snapshot` 返回一致时点的全量状态文档 `{"format_version": 1, "streams": [...]}`。导出在同一把状态锁内完成，期间的创建流、提交事件与推进水位线要么整体包含、要么整体不包含；普通接口不产生任何落盘副作用。
 - `streams` 按流名升序。每个流对象包含 `name`、`window_ms`、`allowed_lateness_ms`、`dedup_retention_ms`（未启用去重时为 `null`，且无 `dedup_records`）、`watermark_ms`（未推进时为 `null`）、尚未最终关闭的 `windows`、已经最终化的 `finalized`；启用去重时还包含保留期内的 `dedup_records`（`event_id`、`timestamp_ms`、`value`）。自动流额外包含成对出现的 `auto_watermark_lag_ms` 与 `max_event_timestamp_ms`（尚无成功接收事件时后者为 `null`）；不含这两个字段的文档按手工流恢复。滑动流额外包含 `slide_ms`；不含该字段的旧文档按滚动窗口恢复。`windows` 与 `finalized` 的窗口对象为 `window_start_ms`、`window_end_ms`、`count`、`sum`，`finalized` 行另含 `stream`；两个数组均按 `window_start_ms` 升序（滑动流按 `slide_ms` 网格对齐），`dedup_records` 按 `event_id` 升序。
 - `POST /snapshot/restore` 仅允许在尚未创建任何流的实例上调用，成功返回 200 `{"restored_streams": N}` 并一次性发布全部状态，其他请求不会观察到部分流；空快照 `{"format_version": 1, "streams": []}` 合法并返回零。恢复后结果查询与导出前一致，开放窗口可继续接收合规事件并在后续水位线下正确最终化，已最终化窗口不会再次进入 `finalized`，保留的标识继续执行重复/冲突判断且淘汰边界不变；自动流恢复后的自动推进、去重与最终结果与导出前一致；滑动流恢复后的继续写入（事件计入全部重叠窗口）、去重淘汰、手工或自动推进及再次导出与未中断实例等价；无写入的再次导出在语义与数组顺序上完全相同。
-- 恢复严格校验且不静默修正：请求体不是合法 JSON 返回 400 `invalid_json`；对象结构、字段类型、`format_version`（仅支持 1，其他版本同样拒绝）、流名唯一性与升序、配置约束（含 `dedup_retention_ms >= allowed_lateness_ms`，以及滑动流的 `slide_ms` 为正整数、不大于 `window_ms` 且整除 `window_ms`）、数组排序、窗口宽度、起点与网格步长对齐、窗口开闭关系、最终结果与水位线/迟到配置的关系、重复窗口或重复 `event_id`、去重记录的保留期边界与所属各窗口计数关系任一不合法，均返回 422 `invalid_snapshot`，实例保持完全为空。自动流的两个字段必须成对出现且类型合法（`auto_watermark_lag_ms` 为非负整数，`max_event_timestamp_ms` 为整数或 `null`）；非空最大事件时间聚合到的每个窗口都必须是已有开放或最终窗口，且水位线不得低于最大事件时间减去滞后量。实例中已存在任意流时，对任何可解析的快照文档都返回 409 `restore_conflict`（请求体本身不是合法 JSON 时仍按请求格式错误返回 400 `invalid_json`），原状态不变。健康检查、手工流、滑动/滚动流间隔离以及其他既有错误优先级均不改变。
+- 恢复严格校验且不静默修正：请求体不是合法 JSON 返回 400 `invalid_json`；对象结构、字段类型、`format_version`（支持 1 与 2，其他版本同样拒绝）、流名唯一性与升序、配置约束（含 `dedup_retention_ms >= allowed_lateness_ms`，以及滑动流的 `slide_ms` 为正整数、不大于 `window_ms` 且整除 `window_ms`）、数组排序、窗口宽度、起点与网格步长对齐、窗口开闭关系、最终结果与水位线/迟到配置的关系、重复窗口或重复 `event_id`、去重记录的保留期边界与所属各窗口计数关系任一不合法，均返回 422 `invalid_snapshot`，实例保持完全为空。自动流的两个字段必须成对出现且类型合法（`auto_watermark_lag_ms` 为非负整数，`max_event_timestamp_ms` 为整数或 `null`）；非空最大事件时间聚合到的每个窗口都必须是已有开放或最终窗口，且水位线不得低于最大事件时间减去滞后量。实例中已存在任意流时，对任何可解析的快照文档都返回 409 `restore_conflict`（请求体本身不是合法 JSON 时仍按请求格式错误返回 400 `invalid_json`），原状态不变。健康检查、手工流、滑动/滚动流间隔离以及其他既有错误优先级均不改变。
+
+## 进程内维表与可选当前值连接
+
+- `POST /tables` 以非空 `name` 创建维表，成功返回 201；重名返回 409 `table_exists`。
+- `POST /tables/{name}/rows` 以非空字符串 `key`、`label` 写行（覆盖式 upsert）：新增或改值返回 `changed: true`，相同重试返回 `changed: false`；未知表返回 404 `table_not_found`。
+- `POST /streams` 可额外携带 `lookup_table`（非空字符串），只能引用已存在的表并在创建响应中回显；格式与字段错误沿用 400 `invalid_json` 与 422 `invalid_request`。
+- 连接流的事件必须携带非空字符串 `lookup_key`（普通流仍将其视为未声明字段）。事件先按既有规则去重、判断迟到，再原子读取当前 `label`；键不存在返回 409 `lookup_key_not_found` 且状态不变。成功事件同时进入总量窗口与按 `(lookup_key, 当时 label)` 的分组聚合（`count`、`sum`）；改表仅影响后续事件。去重内容包含 `lookup_key`：同一 `event_id` 换键返回 409 `event_id_conflict`。滑动流计入全部重叠窗口，窗口关闭时同步最终化分组。
+- `GET /streams/{name}/joined-results` 仅返回最终分组（`stream`、`window_start_ms`、`window_end_ms`、`lookup_key`、`label`、`count`、`sum`），按窗口起点、`lookup_key`、`label` 升序；普通流返回 409 `join_not_enabled`，未知流返回 404 `stream_not_found`。
+- 存在任意维表时 `GET /snapshot` 导出 `format_version: 2`：`tables` 按名称、其行按 `key` 排序，连接流额外携带 `lookup_table`、`joined_windows`、`joined_finalized`（去重记录含 `lookup_key`）。恢复兼容 version 1，严格校验 version 2：未知表引用、重复或乱序键、分组与基础窗口不一致、非有限聚合值或错误排序均返回 422 `invalid_snapshot` 且不发布部分状态；已有流或表时返回 409 `restore_conflict`。未使用连接时，既有接口、错误优先级、响应与 version 1 快照不变。
 
 ## 验证
 
@@ -57,4 +66,4 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-快照覆盖进程内全量状态，可用于跨实例/重启的人工恢复；连接与落盘持久化仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。
+快照覆盖进程内全量状态（含维表与连接分组），可用于跨实例/重启的人工恢复；落盘持久化仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。

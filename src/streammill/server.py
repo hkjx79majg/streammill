@@ -11,11 +11,15 @@ from urllib.parse import unquote, urlsplit
 
 from .service import (
     EventIdConflictError,
+    JoinNotEnabledError,
+    LookupKeyNotFoundError,
     RestoreConflictError,
     Service,
     SnapshotError,
     StreamExistsError,
     StreamNotFoundError,
+    TableExistsError,
+    TableNotFoundError,
     WatermarkRegressionError,
 )
 
@@ -63,6 +67,7 @@ _CREATE_OPTIONAL_FIELDS = {
     "dedup_retention_ms": lambda v: _is_int(v) and v > 0,
     "auto_watermark_lag_ms": lambda v: _is_int(v) and v >= 0,
     "slide_ms": lambda v: _is_int(v) and v > 0,
+    "lookup_table": lambda v: isinstance(v, str) and len(v) > 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -70,6 +75,16 @@ _EVENT_FIELDS = {
 }
 _EVENT_DEDUP_FIELDS = {
     "event_id": lambda v: isinstance(v, str) and len(v) > 0,
+}
+_EVENT_JOIN_FIELDS = {
+    "lookup_key": lambda v: isinstance(v, str) and len(v) > 0,
+}
+_TABLE_FIELDS = {
+    "name": lambda v: isinstance(v, str) and len(v) > 0,
+}
+_ROW_FIELDS = {
+    "key": lambda v: isinstance(v, str) and len(v) > 0,
+    "label": lambda v: isinstance(v, str) and len(v) > 0,
 }
 _WATERMARK_FIELDS = {
     "watermark_ms": _is_int,
@@ -144,6 +159,14 @@ class Handler(BaseHTTPRequestHandler):
             except StreamNotFoundError:
                 self.send_error_json(404, "stream_not_found", f"unknown stream: {segments[1]}")
             return
+        if len(segments) == 3 and segments[0] == "streams" and segments[2] == "joined-results":
+            try:
+                self.send_json(200, self.service.joined_results(segments[1]))
+            except StreamNotFoundError:
+                self.send_error_json(404, "stream_not_found", f"unknown stream: {segments[1]}")
+            except JoinNotEnabledError:
+                self.send_error_json(409, "join_not_enabled", f"stream has no lookup_table: {segments[1]}")
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
@@ -151,6 +174,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if segments == ["streams"]:
                 self._create_stream()
+                return
+            if segments == ["tables"]:
+                self._create_table()
+                return
+            if len(segments) == 3 and segments[0] == "tables" and segments[2] == "rows":
+                self._put_row(segments[1])
                 return
             if len(segments) == 3 and segments[0] == "streams" and segments[2] == "events":
                 self._add_event(segments[1])
@@ -188,28 +217,62 @@ class Handler(BaseHTTPRequestHandler):
                 retention,
                 values.get("auto_watermark_lag_ms"),
                 slide,
+                values.get("lookup_table"),
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
+        except TableNotFoundError:
+            raise _invalid_request(
+                f"unknown lookup_table: {values['lookup_table']}"
+            ) from None
         self.send_json(201, payload)
+
+    def _create_table(self) -> None:
+        values = _validate(self._read_json(), _TABLE_FIELDS)
+        try:
+            payload = self.service.create_table(values["name"])
+        except TableExistsError:
+            raise _RequestError(409, "table_exists", f"table already exists: {values['name']}") from None
+        self.send_json(201, payload)
+
+    def _put_row(self, table: str) -> None:
+        values = _validate(self._read_json(), _ROW_FIELDS)
+        try:
+            payload = self.service.put_row(table, values["key"], values["label"])
+        except TableNotFoundError:
+            raise _RequestError(404, "table_not_found", f"unknown table: {table}") from None
+        self.send_json(200, payload)
 
     def _add_event(self, name: str) -> None:
         body = self._read_json()
-        if self.service.dedup_enabled(name):
-            values = _validate(body, {**_EVENT_FIELDS, **_EVENT_DEDUP_FIELDS})
-        else:
-            # Unknown streams validate against the base shape, matching the
-            # historical 422-before-404 ordering; event_id stays undeclared.
-            values = _validate(body, _EVENT_FIELDS)
+        features = self.service.stream_features(name)
+        fields = dict(_EVENT_FIELDS)
+        if features is not None:
+            if features["dedup"]:
+                fields.update(_EVENT_DEDUP_FIELDS)
+            if features["join"]:
+                fields.update(_EVENT_JOIN_FIELDS)
+        # Unknown streams validate against the base shape, matching the
+        # historical 422-before-404 ordering; event_id and lookup_key stay
+        # undeclared there.
+        values = _validate(body, fields)
         try:
             payload = self.service.add_event(
-                name, values["timestamp_ms"], values["value"], values.get("event_id")
+                name,
+                values["timestamp_ms"],
+                values["value"],
+                values.get("event_id"),
+                values.get("lookup_key"),
             )
         except StreamNotFoundError:
             raise _RequestError(404, "stream_not_found", f"unknown stream: {name}") from None
         except EventIdConflictError:
             raise _RequestError(
                 409, "event_id_conflict", f"conflicting event_id: {values['event_id']}"
+            ) from None
+        except LookupKeyNotFoundError:
+            raise _RequestError(
+                409, "lookup_key_not_found", f"unknown lookup_key: {values['lookup_key']}"
             ) from None
         self.send_json(200, payload)
 
@@ -231,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             raise _RequestError(
                 409,
                 "restore_conflict",
-                "snapshot restore is only allowed on an instance without streams",
+                "snapshot restore is only allowed on an instance without streams or tables",
             ) from None
         except SnapshotError as exc:
             raise _RequestError(422, "invalid_snapshot", str(exc)) from None
