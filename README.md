@@ -92,6 +92,14 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - 批次按输入顺序执行相同检查，任一元素超限则整体返回 429 `stream_backpressured`，原子回滚且不占用 `batch_id`。并发写入按既有提交全序争用名额，成功响应后的开放窗口数不超过上限。
 - 任一流启用该功能时 `GET /snapshot` 导出 `format_version: 6`（始终携带 `tables` 数组），对应流额外携带 `max_open_windows`；均未启用时继续导出既有版本与文档形状。恢复兼容 version 1 至 5；version 6 至少一条流须携带正整数 `max_open_windows`，旧版本文档不得携带该字段，且启用流的开放基础窗口数不得超过上限，任一违规返回 422 `invalid_snapshot` 且实例保持为空。恢复后的压力查询、名额释放、批次回滚、变更序号与后续写入与未中断实例一致，本地持久化原子保存配置与状态。除新增 429 情形外，健康检查、结果查询、连接、变更游标、旧快照恢复以及未启用流的响应与错误优先级不变。
 
+## 可选的维表变更数据捕获（CDC）
+
+- `POST /tables` 可额外携带 `cdc_retention`（正整数），限定该表变更流最多保留的记录条数并在创建响应中回显；不提供时写入、查询与快照形状与既有行为完全一致，`GET /tables/{name}/changes` 返回 409 `cdc_not_enabled`。类型或范围不合法返回 422 `invalid_request`，表不会被创建。
+- 启用后 `GET /tables/{name}/changes?after_seq=N&limit=L` 返回 `seq` 大于 `N` 的保留记录：`N` 为非负整数，`L` 为 1 至 1000；响应为 `{"table", "latest_seq", "changes"}`，`changes` 按 `seq` 递增，初始 `latest_seq` 为 0。缺失、重复、未知或越界参数返回 422 `invalid_request`（参数校验先于表存在性检查）；未知表返回 404 `table_not_found`。
+- `seq` 从 1 连续递增。当前值表的每次改值 upsert 产生一条 `{"seq", "kind": "upsert", "key", "label"}` 记录（携带新 label）；版本维表每个新增版本点产生一条记录，另含 `effective_from_ms`。等值重试返回 `changed: false` 且不消耗序号；版本点标签冲突仍返回 409 `dimension_version_conflict` 且不产生记录。表状态与变更记录在同一状态锁内按同一顺序原子提交，读取只能看到完整提交。
+- 每次提交后裁掉最旧记录，最多保留 `cdc_retention` 条，`latest_seq` 不回退。`after_seq` 大于 `latest_seq` 返回 409 `cdc_cursor_ahead`；仍有保留记录且 `after_seq` 小于最早保留 `seq` 减一时返回 410 `cdc_cursor_expired`。持久化失败沿用 503 `state_persist_failed` 并回滚本次提交的表状态与记录。
+- 存在任意启用 CDC 的表时 `GET /snapshot` 导出 `format_version: 7`（始终携带 `tables` 数组），启用的表额外携带 `cdc_retention`、`latest_cdc_seq` 与保留的 `cdc_changes`；其他表与流的字段不变。恢复兼容 version 1 至 6；version 7 至少有一张启用表，并严格校验：保留量为正整数、保留记录恰好是以 `latest_cdc_seq` 结尾且不超限的连续序号、记录形状符合表模式（版本表记录含 `effective_from_ms`）、记录不与当前行或版本点矛盾，任一不合法均返回 422 `invalid_snapshot` 且不发布任何状态。恢复后游标、下一序号、裁剪与持久化提交与未中断实例一致；未启用 CDC 的实例继续导出既有版本与形状，其余公开行为不变。
+
 ## 可选的本地状态文件持久化
 
 - 设置环境变量 `STREAMMILL_STATE_FILE` 为非空文件路径即启用持久化；未设置时服务保持纯内存行为，所有接口、响应与错误优先级完全不变。启用后不改变任何 HTTP 入口。
