@@ -23,6 +23,8 @@ from .service import (
     RestoreConflictError,
     Service,
     SnapshotError,
+    StateFileError,
+    StatePersistError,
     StreamExistsError,
     StreamNotFoundError,
     TableExistsError,
@@ -37,6 +39,11 @@ def env_address() -> tuple[str, int]:
     if not host or not port.isdigit():
         raise SystemExit(f"invalid STREAMMILL_ADDR: {raw!r}")
     return host, int(port)
+
+
+def env_state_file() -> str | None:
+    """Configured local state file path; None keeps in-memory behavior."""
+    return os.environ.get("STREAMMILL_STATE_FILE")
 
 
 class _RequestError(Exception):
@@ -221,6 +228,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
         except _RequestError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        except StatePersistError as exc:
+            self.send_error_json(503, "state_persist_failed", str(exc))
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
@@ -445,6 +455,14 @@ def main() -> int:
     parser.add_argument("--host", default=host)
     parser.add_argument("--port", type=int, default=port)
     args = parser.parse_args()
+    state_file = env_state_file()
+    if state_file is not None:
+        # Persistent mode: any startup contract violation exits non-zero
+        # before the server starts listening.
+        try:
+            Handler.service = Service.from_state_file(state_file)
+        except StateFileError as exc:
+            raise SystemExit(f"invalid STREAMMILL_STATE_FILE: {exc}") from None
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"StreamMill listening on http://{args.host}:{httpd.server_address[1]}", flush=True)
     try:
