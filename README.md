@@ -10,7 +10,7 @@
 PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 ```
 
-服务默认监听 `127.0.0.1:8080`，可通过 `STREAMMILL_ADDR` 修改。`GET /healthz` 返回 JSON 健康状态。
+服务默认监听 `127.0.0.1:8080`，可通过 `STREAMMILL_ADDR` 修改。`GET /healthz` 返回 JSON 健康状态。可选的 `STREAMMILL_STATE_FILE` 启用本地状态文件持久化（见下文）。
 
 ## 事件时间滚动窗口
 
@@ -84,10 +84,18 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - `lookup_table` 引用版本维表的连接流中，每个事件以自身 `timestamp_ms` 选择不晚于该时间的最新版本参与分组聚合；键不存在或事件时间早于该键首个版本返回 409 `lookup_version_not_found`，聚合、去重、水位线、变更序号与批次均不变。之后补写的维度历史只影响事件时间不早于它的事件，不重算已接收事件。去重内容仍包含 `lookup_key`；批次中任一元素找不到版本时整批回滚，失败请求不占用 `batch_id`。
 - 只要存在版本维表，`GET /snapshot` 即导出 `format_version: 5`（始终携带 `tables` 数组）：版本维表对象携带 `event_time_versioned: true` 与 `versions`（`key`、`label`、`effective_from_ms`），版本点按 `key`、`effective_from_ms` 严格升序；当前值维表保持 `rows` 形状，流对象字段与 version 4 相同。恢复兼容 version 1 至 4，并严格校验 version 5：模式字段组合错误（`rows` 与版本标记混用、`versions` 缺少标记或标记非 `true`）、重复或乱序版本点、无效生效时间及同一点冲突均返回 422 `invalid_snapshot` 且不发布部分状态；恢复后按事件时间的连接解析、批次重放与变更游标与未中断实例一致。普通维表、未连接流、已有结果与 joined-results 排序、迟到与自动水位线规则、去重淘汰、变更流游标、批次重放、健康检查及既有错误优先级均保持不变。
 
+## 可选的本地状态文件持久化
+
+- 设置环境变量 `STREAMMILL_STATE_FILE` 为非空文件路径即启用持久化；未设置时保持纯内存行为，所有接口响应不变。文件不存在时以空实例启动（首个提交创建文件）；文件存在时在开始监听前按 `POST /snapshot/restore` 的同一契约严格载入，不静默修正。
+- 持久模式下，每个改变公开状态的成功请求（创建流或维表、写维表行、提交单事件或批次、推进水位线、从空实例恢复快照）都是单个提交：完整的新快照先原子写入状态文件（临时文件 + fsync + 原子重命名 + 目录 fsync），然后才返回成功；客户端收到成功后即使进程被强制终止并重启，也能观察到该提交。并发修改按状态锁顺序持久化。
+- 过迟丢弃、精确重复、相同维表值、相同水位线与已记录批次的相同重放仍返回既有成功结果但不改写文件；所有既有 4xx 失败也不改写文件；`GET /snapshot`、`GET /healthz` 与查询接口永不触发写入。
+- 启动时路径为空、指向目录、父目录不存在或不可写，或已有文件不是合法 UTF-8 JSON、不是合法快照文档，服务以非零状态退出且不开始监听。运行期间某次持久化失败时，该请求返回 503 `state_persist_failed`，内存状态与状态文件都保持提交前的完整版本，随后重试按未发生过该请求处理。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-快照覆盖进程内全量状态（含维表与连接分组），可用于跨实例/重启的人工恢复；落盘持久化仍不在当前范围，由后续任务从已冻结事实出发独立设计并验证。
+快照覆盖进程内全量状态（含维表与连接分组），可用于跨实例/重启的人工恢复；启用 `STREAMMILL_STATE_FILE` 后同一快照契约也用于每次提交的自动落盘与重启恢复。
+

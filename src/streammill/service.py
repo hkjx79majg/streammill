@@ -201,7 +201,22 @@ strictly (mode field combinations, duplicate or out-of-order versions,
 invalid effective times and conflicting points all raise SnapshotError
 without publishing partial state).
 
-Disk persistence remains out of scope.
+Optional local persistence is available by attaching a
+``streammill.persistence.StateStore`` (the server does this when
+``STREAMMILL_STATE_FILE`` names a non-empty path). Every successful
+state-changing request — creating a stream or table, writing a row,
+committing a single event or batch, advancing a watermark, restoring a
+snapshot onto an empty instance — is then one durable commit: the full
+post-commit snapshot must reach the state file before the success is
+released, and a persistence failure rolls the in-memory state back to
+the pre-commit snapshot (which the atomically-written file still holds)
+and raises StatePersistError. Commits serialize under the existing
+service lock, so the persisted order matches the in-memory order.
+Successful requests that change nothing (too-late drops, exact
+duplicates, unchanged table values, unchanged watermarks, retained
+batch replays) skip the write without altering persistence semantics,
+and reads never touch the file. Without a store the service keeps the
+pure in-memory behavior above.
 """
 
 from __future__ import annotations
@@ -286,6 +301,10 @@ class SnapshotError(Exception):
 
 class RestoreConflictError(Exception):
     """Raised when restore targets an instance that already has streams."""
+
+
+class StatePersistError(Exception):
+    """Raised when a commit cannot be persisted to the state file."""
 
 
 def _is_int(value: object) -> bool:
@@ -1787,24 +1806,66 @@ class Service:
     name = "streammill"
     version = __version__
 
-    def __init__(self) -> None:
+    def __init__(self, state_store=None) -> None:
         self._lock = threading.Lock()
         self._streams: dict[str, _Stream] = {}
         # table name -> _Table; in-process dimension tables.
         self._tables: dict[str, _Table] = {}
+        # Optional durable state file; None keeps pure in-memory behavior.
+        self._state_store = state_store
+
+    def attach_state_store(self, state_store) -> None:
+        """Enable durable commits to ``state_store`` from this point on."""
+        with self._lock:
+            self._state_store = state_store
+
+    def _commit(self, mutate):
+        """Run one state-changing operation as a single durable commit.
+
+        ``mutate`` executes under the service lock and returns
+        ``(payload, changed)``; domain errors propagate before anything
+        is persisted. Without a state store only the in-memory mutation
+        happens. With one, a commit that changed public state must reach
+        the state file (as the full post-commit snapshot) before its
+        payload is released; if persisting fails, the in-memory state is
+        rolled back to the pre-commit snapshot — which the atomically
+        written file still holds — and StatePersistError is raised, so
+        the request is exactly as if it never happened. Commits (and
+        their writes) serialize under the service lock, so the persisted
+        order matches the in-memory commit order.
+        """
+        with self._lock:
+            if self._state_store is None:
+                payload, _changed = mutate()
+                return payload
+            pre_image = self._snapshot_locked()
+            payload, changed = mutate()
+            if changed:
+                try:
+                    self._state_store.persist(self._snapshot_locked())
+                except Exception as exc:
+                    self._streams = {}
+                    self._tables = {}
+                    self._restore_document_locked(pre_image)
+                    raise StatePersistError(
+                        f"state commit could not be persisted: {exc}"
+                    ) from exc
+            return payload
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
 
     def create_table(self, name: str, event_time_versioned: bool = False) -> dict:
-        with self._lock:
+        def mutate() -> tuple[dict, bool]:
             if name in self._tables:
                 raise TableExistsError(name)
             self._tables[name] = _Table(event_time_versioned)
-        payload = {"table": name}
-        if event_time_versioned:
-            payload["event_time_versioned"] = True
-        return payload
+            payload = {"table": name}
+            if event_time_versioned:
+                payload["event_time_versioned"] = True
+            return payload, True
+
+        return self._commit(mutate)
 
     def table_features(self, name: str) -> dict | None:
         """Row-surface features of the table; None if it is unknown."""
@@ -1815,13 +1876,20 @@ class Service:
             return {"event_time_versioned": table.event_time_versioned}
 
     def put_row(self, table: str, key: str, label: str) -> dict:
-        with self._lock:
+        def mutate() -> tuple[dict, bool]:
             target = self._tables.get(table)
             if target is None:
                 raise TableNotFoundError(table)
             changed = target.rows.get(key) != label
             target.rows[key] = label
-        return {"table": table, "key": key, "label": label, "changed": changed}
+            return {
+                "table": table,
+                "key": key,
+                "label": label,
+                "changed": changed,
+            }, changed
+
+        return self._commit(mutate)
 
     def put_version_row(
         self, table: str, key: str, label: str, effective_from_ms: int
@@ -1832,18 +1900,20 @@ class Service:
         ``changed: False`` and a conflicting label at an existing point
         raises DimensionVersionConflictError with the history untouched.
         """
-        with self._lock:
+        def mutate() -> tuple[dict, bool]:
             target = self._tables.get(table)
             if target is None:
                 raise TableNotFoundError(table)
             changed = target.put_version(key, label, effective_from_ms)
-        return {
-            "table": table,
-            "key": key,
-            "label": label,
-            "effective_from_ms": effective_from_ms,
-            "changed": changed,
-        }
+            return {
+                "table": table,
+                "key": key,
+                "label": label,
+                "effective_from_ms": effective_from_ms,
+                "changed": changed,
+            }, changed
+
+        return self._commit(mutate)
 
     def create_stream(
         self,
@@ -1857,7 +1927,7 @@ class Service:
         change_retention: int | None = None,
         batch_retention: int | None = None,
     ) -> dict:
-        with self._lock:
+        def mutate() -> tuple[dict, bool]:
             if name in self._streams:
                 raise StreamExistsError(name)
             if lookup_table is not None and lookup_table not in self._tables:
@@ -1873,24 +1943,26 @@ class Service:
                 change_retention,
                 batch_retention,
             )
-        payload = {
-            "stream": name,
-            "window_ms": window_ms,
-            "allowed_lateness_ms": allowed_lateness_ms,
-        }
-        if dedup_retention_ms is not None:
-            payload["dedup_retention_ms"] = dedup_retention_ms
-        if auto_watermark_lag_ms is not None:
-            payload["auto_watermark_lag_ms"] = auto_watermark_lag_ms
-        if slide_ms is not None:
-            payload["slide_ms"] = slide_ms
-        if lookup_table is not None:
-            payload["lookup_table"] = lookup_table
-        if change_retention is not None:
-            payload["change_retention"] = change_retention
-        if batch_retention is not None:
-            payload["batch_retention"] = batch_retention
-        return payload
+            payload = {
+                "stream": name,
+                "window_ms": window_ms,
+                "allowed_lateness_ms": allowed_lateness_ms,
+            }
+            if dedup_retention_ms is not None:
+                payload["dedup_retention_ms"] = dedup_retention_ms
+            if auto_watermark_lag_ms is not None:
+                payload["auto_watermark_lag_ms"] = auto_watermark_lag_ms
+            if slide_ms is not None:
+                payload["slide_ms"] = slide_ms
+            if lookup_table is not None:
+                payload["lookup_table"] = lookup_table
+            if change_retention is not None:
+                payload["change_retention"] = change_retention
+            if batch_retention is not None:
+                payload["batch_retention"] = batch_retention
+            return payload, True
+
+        return self._commit(mutate)
 
     def stream_features(self, name: str) -> dict | None:
         """Event-surface features of the stream; None if it is unknown."""
@@ -1911,12 +1983,17 @@ class Service:
         event_id: str | None = None,
         lookup_key: str | None = None,
     ) -> dict:
-        with self._lock:
+        def mutate() -> tuple[dict, bool]:
             stream = self._get(name)
             outcome = stream.add_event(
                 timestamp_ms, value, event_id, lookup_key, self._label_of(stream)
             )
-        return {"stream": name, **outcome}
+            # Too-late drops and exact duplicates change nothing, so they
+            # skip the durable write; accepted events are one commit.
+            changed = not outcome.get("dropped") and not outcome.get("duplicate")
+            return {"stream": name, **outcome}, changed
+
+        return self._commit(mutate)
 
     def add_batch(self, name: str, batch_id: str, events: list[dict]) -> dict:
         """Apply one atomic batch of events to a batch-enabled stream.
@@ -1929,16 +2006,18 @@ class Service:
         BatchIdConflictError. A processing failure rolls the whole batch
         back and occupies no identifier. Only successful batches are
         remembered, capped at the stream's ``batch_retention`` newest
-        records; replaying never refreshes that order.
+        records; replaying never refreshes that order. A replay is a
+        no-op commit and skips the durable write; a new batch is
+        persisted as one commit together with its record.
         """
-        with self._lock:
+        def mutate() -> tuple[dict, bool]:
             stream = self._get(name)
             if stream.batch_retention is None:
                 raise BatchIngestNotEnabledError(name)
             for record in stream._batches:
                 if record["batch_id"] == batch_id:
                     if record["request"]["events"] == events:
-                        return copy.deepcopy(record["response"])
+                        return copy.deepcopy(record["response"]), False
                     raise BatchIdConflictError(batch_id)
             outcomes = stream.apply_batch(events, self._label_of(stream))
             response = {"stream": name, "batch_id": batch_id, "outcomes": outcomes}
@@ -1955,7 +2034,9 @@ class Service:
             overflow = len(stream._batches) - stream.batch_retention
             if overflow > 0:
                 del stream._batches[:overflow]
-            return response
+            return response, True
+
+        return self._commit(mutate)
 
     def _label_of(self, stream: _Stream):
         """Label reader for a joined stream, else None.
@@ -1986,9 +2067,19 @@ class Service:
         return label_of
 
     def advance_watermark(self, name: str, watermark_ms: int) -> dict:
-        with self._lock:
-            finalized = self._get(name).advance_watermark(watermark_ms)
-        return {"stream": name, "watermark_ms": watermark_ms, "finalized": finalized}
+        def mutate() -> tuple[dict, bool]:
+            stream = self._get(name)
+            # Repeating the current watermark is an idempotent no-op and
+            # skips the durable write; a regression raises before that.
+            changed = stream.watermark != watermark_ms
+            finalized = stream.advance_watermark(watermark_ms)
+            return {
+                "stream": name,
+                "watermark_ms": watermark_ms,
+                "finalized": finalized,
+            }, changed
+
+        return self._commit(mutate)
 
     def results(self, name: str) -> dict:
         with self._lock:
@@ -2052,48 +2143,52 @@ class Service:
         document is the unchanged version 1 shape.
         """
         with self._lock:
-            streams = [
-                self._streams[name].to_snapshot() for name in sorted(self._streams)
-            ]
-            tables = [self._table_to_snapshot(name) for name in sorted(self._tables)]
-            if any(
-                table.event_time_versioned for table in self._tables.values()
-            ):
-                return {
-                    "format_version": SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
-                    "tables": tables,
-                    "streams": streams,
-                }
-            batches = any(
-                stream.batch_retention is not None
-                for stream in self._streams.values()
-            )
-            if batches:
-                return {
-                    "format_version": SNAPSHOT_FORMAT_VERSION_BATCHES,
-                    "tables": tables,
-                    "streams": streams,
-                }
-            change_feed = any(
-                stream.change_retention is not None
-                for stream in self._streams.values()
-            )
-            if change_feed:
-                return {
-                    "format_version": SNAPSHOT_FORMAT_VERSION_CHANGES,
-                    "tables": tables,
-                    "streams": streams,
-                }
-            if self._tables:
-                return {
-                    "format_version": SNAPSHOT_FORMAT_VERSION_JOIN,
-                    "tables": tables,
-                    "streams": streams,
-                }
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict:
+        """Snapshot body; caller must hold the service lock."""
+        streams = [
+            self._streams[name].to_snapshot() for name in sorted(self._streams)
+        ]
+        tables = [self._table_to_snapshot(name) for name in sorted(self._tables)]
+        if any(
+            table.event_time_versioned for table in self._tables.values()
+        ):
             return {
-                "format_version": SNAPSHOT_FORMAT_VERSION,
+                "format_version": SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+                "tables": tables,
                 "streams": streams,
             }
+        batches = any(
+            stream.batch_retention is not None
+            for stream in self._streams.values()
+        )
+        if batches:
+            return {
+                "format_version": SNAPSHOT_FORMAT_VERSION_BATCHES,
+                "tables": tables,
+                "streams": streams,
+            }
+        change_feed = any(
+            stream.change_retention is not None
+            for stream in self._streams.values()
+        )
+        if change_feed:
+            return {
+                "format_version": SNAPSHOT_FORMAT_VERSION_CHANGES,
+                "tables": tables,
+                "streams": streams,
+            }
+        if self._tables:
+            return {
+                "format_version": SNAPSHOT_FORMAT_VERSION_JOIN,
+                "tables": tables,
+                "streams": streams,
+            }
+        return {
+            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "streams": streams,
+        }
 
     def _table_to_snapshot(self, name: str) -> dict:
         """Serialize one table as one entry of the snapshot's tables array."""
@@ -2138,9 +2233,10 @@ class Service:
         as on the uninterrupted instance); version 5 documents
         additionally restore event-time versioned tables (mode markers
         and version timelines) under strict validation. Returns the
-        restored stream count.
+        restored stream count. With a state store attached the restored
+        state is persisted as one commit before the call returns.
         """
-        with self._lock:
+        def mutate() -> tuple[int, bool]:
             # Conflict takes priority over every content check: an instance
             # with streams or tables always gets restore_conflict.
             if self._streams or self._tables:
@@ -2148,82 +2244,93 @@ class Service:
                     "restore is only allowed on an instance without streams "
                     "or tables"
                 )
-            if not isinstance(document, dict):
-                raise SnapshotError("snapshot document must be a JSON object")
-            if "format_version" not in document:
-                raise SnapshotError(
-                    "snapshot document missing required field: format_version"
-                )
-            version = document["format_version"]
-            if not _is_int(version):
-                raise SnapshotError("format_version must be an integer")
-            tables_versions = (
-                SNAPSHOT_FORMAT_VERSION_JOIN,
-                SNAPSHOT_FORMAT_VERSION_CHANGES,
-                SNAPSHOT_FORMAT_VERSION_BATCHES,
-                SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+            return self._restore_document_locked(document), True
+
+        return self._commit(mutate)
+
+    def _restore_document_locked(self, document: object) -> int:
+        """Validate and publish a snapshot on an empty instance.
+
+        Caller must hold the service lock and guarantee the instance has
+        no streams or tables. Any invalid document raises SnapshotError
+        and leaves the (empty) instance untouched.
+        """
+        if not isinstance(document, dict):
+            raise SnapshotError("snapshot document must be a JSON object")
+        if "format_version" not in document:
+            raise SnapshotError(
+                "snapshot document missing required field: format_version"
             )
-            if version == SNAPSHOT_FORMAT_VERSION:
-                allowed = {"format_version", "streams"}
-            elif version in tables_versions:
-                allowed = {"format_version", "streams", "tables"}
-            else:
-                raise SnapshotError(f"unsupported format_version: {version}")
-            extra = sorted(set(document) - allowed)
-            if extra:
-                raise SnapshotError(
-                    f"snapshot document has unexpected field: {extra[0]}"
-                )
-            missing = sorted(allowed - set(document))
-            if missing:
-                raise SnapshotError(
-                    f"snapshot document missing required field: {missing[0]}"
-                )
-            entries = document["streams"]
-            if not isinstance(entries, list):
-                raise SnapshotError("streams must be an array")
+        version = document["format_version"]
+        if not _is_int(version):
+            raise SnapshotError("format_version must be an integer")
+        tables_versions = (
+            SNAPSHOT_FORMAT_VERSION_JOIN,
+            SNAPSHOT_FORMAT_VERSION_CHANGES,
+            SNAPSHOT_FORMAT_VERSION_BATCHES,
+            SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+        )
+        if version == SNAPSHOT_FORMAT_VERSION:
+            allowed = {"format_version", "streams"}
+        elif version in tables_versions:
+            allowed = {"format_version", "streams", "tables"}
+        else:
+            raise SnapshotError(f"unsupported format_version: {version}")
+        extra = sorted(set(document) - allowed)
+        if extra:
+            raise SnapshotError(
+                f"snapshot document has unexpected field: {extra[0]}"
+            )
+        missing = sorted(allowed - set(document))
+        if missing:
+            raise SnapshotError(
+                f"snapshot document missing required field: {missing[0]}"
+            )
+        entries = document["streams"]
+        if not isinstance(entries, list):
+            raise SnapshotError("streams must be an array")
 
-            tables: dict[str, _Table] = {}
-            if version in tables_versions:
-                tables = self._parse_tables(
-                    document["tables"],
-                    allow_versioned=(
-                        version == SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES
-                    ),
-                )
+        tables: dict[str, _Table] = {}
+        if version in tables_versions:
+            tables = self._parse_tables(
+                document["tables"],
+                allow_versioned=(
+                    version == SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES
+                ),
+            )
 
-            # Build and validate everything before the single publishing
-            # assignment, so a failure leaves no partial state and concurrent
-            # requests never observe half-restored streams.
-            restored: dict[str, _Stream] = {}
-            previous_name: str | None = None
-            for entry in entries:
-                stream = _Stream.from_snapshot(
-                    entry,
-                    table_names=set(tables) if version in tables_versions else None,
-                    allow_change_feed=version
-                    in (
-                        SNAPSHOT_FORMAT_VERSION_CHANGES,
-                        SNAPSHOT_FORMAT_VERSION_BATCHES,
-                        SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
-                    ),
-                    allow_batches=version
-                    in (
-                        SNAPSHOT_FORMAT_VERSION_BATCHES,
-                        SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
-                    ),
+        # Build and validate everything before the single publishing
+        # assignment, so a failure leaves no partial state and concurrent
+        # requests never observe half-restored streams.
+        restored: dict[str, _Stream] = {}
+        previous_name: str | None = None
+        for entry in entries:
+            stream = _Stream.from_snapshot(
+                entry,
+                table_names=set(tables) if version in tables_versions else None,
+                allow_change_feed=version
+                in (
+                    SNAPSHOT_FORMAT_VERSION_CHANGES,
+                    SNAPSHOT_FORMAT_VERSION_BATCHES,
+                    SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+                ),
+                allow_batches=version
+                in (
+                    SNAPSHOT_FORMAT_VERSION_BATCHES,
+                    SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+                ),
+            )
+            if stream.name in restored:
+                raise SnapshotError(
+                    f"duplicate stream name in snapshot: {stream.name!r}"
                 )
-                if stream.name in restored:
-                    raise SnapshotError(
-                        f"duplicate stream name in snapshot: {stream.name!r}"
-                    )
-                if previous_name is not None and stream.name <= previous_name:
-                    raise SnapshotError("streams must be strictly ordered by name")
-                previous_name = stream.name
-                restored[stream.name] = stream
-            self._tables = tables
-            self._streams = restored
-            return len(restored)
+            if previous_name is not None and stream.name <= previous_name:
+                raise SnapshotError("streams must be strictly ordered by name")
+            previous_name = stream.name
+            restored[stream.name] = stream
+        self._tables = tables
+        self._streams = restored
+        return len(restored)
 
     @staticmethod
     def _parse_tables(value: object, allow_versioned: bool = False) -> dict:

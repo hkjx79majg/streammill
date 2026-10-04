@@ -6,9 +6,11 @@ import argparse
 import json
 import math
 import os
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+from .persistence import StateStore, StateStoreError
 from .service import (
     BatchIdConflictError,
     BatchIngestNotEnabledError,
@@ -23,6 +25,7 @@ from .service import (
     RestoreConflictError,
     Service,
     SnapshotError,
+    StatePersistError,
     StreamExistsError,
     StreamNotFoundError,
     TableExistsError,
@@ -221,6 +224,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
         except _RequestError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        except StatePersistError as exc:
+            self.send_error_json(503, "state_persist_failed", str(exc))
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
@@ -445,6 +451,24 @@ def main() -> int:
     parser.add_argument("--host", default=host)
     parser.add_argument("--port", type=int, default=port)
     args = parser.parse_args()
+    service = Service()
+    state_file = os.environ.get("STREAMMILL_STATE_FILE")
+    if state_file is not None:
+        # Persistent mode: validate the path and, when the file exists,
+        # load the full snapshot through the regular restore contract
+        # before anything starts listening. Any failure is fatal.
+        try:
+            store, document = StateStore.open(state_file)
+            if document is not None:
+                service.restore_snapshot(document)
+        except (StateStoreError, SnapshotError) as exc:
+            print(
+                f"cannot start with STREAMMILL_STATE_FILE={state_file!r}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        service.attach_state_store(store)
+    Handler.service = service
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"StreamMill listening on http://{args.host}:{httpd.server_address[1]}", flush=True)
     try:
