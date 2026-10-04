@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .service import (
+    BackpressureNotEnabledError,
     BatchIdConflictError,
     BatchIngestNotEnabledError,
     ChangeCursorAheadError,
@@ -25,6 +26,7 @@ from .service import (
     SnapshotError,
     StateFileError,
     StatePersistError,
+    StreamBackpressuredError,
     StreamExistsError,
     StreamNotFoundError,
     TableExistsError,
@@ -84,6 +86,7 @@ _CREATE_OPTIONAL_FIELDS = {
     "lookup_table": lambda v: isinstance(v, str) and len(v) > 0,
     "change_retention": lambda v: _is_int(v) and v > 0,
     "batch_retention": lambda v: _is_int(v) and v > 0,
+    "max_open_windows": lambda v: _is_int(v) and v > 0,
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -194,6 +197,14 @@ class Handler(BaseHTTPRequestHandler):
             except JoinNotEnabledError:
                 self.send_error_json(409, "join_not_enabled", f"stream has no lookup_table: {segments[1]}")
             return
+        if len(segments) == 3 and segments[0] == "streams" and segments[2] == "pressure":
+            try:
+                self.send_json(200, self.service.pressure(segments[1]))
+            except StreamNotFoundError:
+                self.send_error_json(404, "stream_not_found", f"unknown stream: {segments[1]}")
+            except BackpressureNotEnabledError:
+                self.send_error_json(409, "backpressure_not_enabled", f"stream has no max_open_windows: {segments[1]}")
+            return
         if len(segments) == 3 and segments[0] == "streams" and segments[2] == "changes":
             try:
                 self._get_changes(segments[1])
@@ -259,6 +270,7 @@ class Handler(BaseHTTPRequestHandler):
                 values.get("lookup_table"),
                 values.get("change_retention"),
                 values.get("batch_retention"),
+                values.get("max_open_windows"),
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None
@@ -335,6 +347,10 @@ class Handler(BaseHTTPRequestHandler):
                 409, "lookup_version_not_found",
                 f"no dimension version for lookup_key: {values['lookup_key']}",
             ) from None
+        except StreamBackpressuredError:
+            raise _RequestError(
+                429, "stream_backpressured", f"open window limit reached: {name}"
+            ) from None
         self.send_json(200, payload)
 
     def _add_batch(self, name: str) -> None:
@@ -375,6 +391,10 @@ class Handler(BaseHTTPRequestHandler):
             raise _RequestError(
                 409, "lookup_version_not_found",
                 f"no dimension version for lookup_key: {exc}",
+            ) from None
+        except StreamBackpressuredError:
+            raise _RequestError(
+                429, "stream_backpressured", f"open window limit reached: {name}"
             ) from None
         self.send_json(200, payload)
 
