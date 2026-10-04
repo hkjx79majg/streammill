@@ -263,6 +263,45 @@ SnapshotError and leaves the instance empty. After a restore the
 pressure query, slot release, batch rollback, change sequence and
 subsequent writes behave exactly as on the uninterrupted instance, and
 local persistence saves the configuration and state atomically.
+
+Dimension tables of either mode may optionally publish a
+change-data-capture feed by passing a positive ``cdc_retention`` at
+creation time (echoed in the create response; without it the table
+behaves exactly as before and ``Service.table_changes`` raises
+CdcNotEnabledError). On such tables every state-changing write appends
+one record numbered by a ``seq`` that starts at 1 and never regresses:
+
+* a current-value upsert that changes the stored label appends one
+  ``upsert`` record carrying the ``key`` and the new ``label``;
+* a versioned table appends one ``upsert`` record per newly inserted
+  version point, additionally carrying its ``effective_from_ms``;
+* identical retries report ``changed: false`` and never consume a
+  sequence number, and a conflicting version point raises
+  DimensionVersionConflictError without producing a record.
+
+Only the newest ``cdc_retention`` records are kept (older ones are
+trimmed after every commit, without moving ``latest_cdc_seq``).
+``Service.table_changes`` returns the retained records with ``seq``
+greater than a cursor, ascending, together with the current
+``latest_seq`` (0 before the first write); a cursor past ``latest_seq``
+raises CdcCursorAheadError and a cursor that has fallen behind the
+oldest retained record raises CdcCursorExpiredError. The table state
+and its records commit under the same lock, so concurrent readers only
+ever observe them in one consistent order, and a failed persist rolls
+the whole commit back.
+
+Instances with at least one CDC-enabled table export snapshots as
+``format_version`` 7, which always carries the ``tables`` array and, on
+enabled tables, ``cdc_retention``/``latest_cdc_seq``/``cdc_changes``;
+every other table and stream shape is unchanged. Restore stays
+compatible with versions 1 to 6; a version 7 document must enable the
+feed on at least one table, and the retained records are validated
+strictly (positive retention, the retention cap, consecutive sequence
+numbers ending at ``latest_cdc_seq``, shapes after the table's mode,
+and consistency with the current rows or version points) — any
+violation raises SnapshotError without publishing state. After a
+restore the cursor, the next sequence number, trimming and persisted
+commits behave exactly as on the uninterrupted instance.
 """
 
 from __future__ import annotations
@@ -283,6 +322,7 @@ SNAPSHOT_FORMAT_VERSION_CHANGES = 3
 SNAPSHOT_FORMAT_VERSION_BATCHES = 4
 SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES = 5
 SNAPSHOT_FORMAT_VERSION_BACKPRESSURE = 6
+SNAPSHOT_FORMAT_VERSION_CDC = 7
 
 
 class StreamExistsError(Exception):
@@ -347,6 +387,18 @@ class StreamBackpressuredError(Exception):
 
 class BackpressureNotEnabledError(Exception):
     """Raised when querying pressure of a stream without an open-window limit."""
+
+
+class CdcNotEnabledError(Exception):
+    """Raised when reading the change feed of a table without one."""
+
+
+class CdcCursorAheadError(Exception):
+    """Raised when a table change cursor is past the latest sequence number."""
+
+
+class CdcCursorExpiredError(Exception):
+    """Raised when a table change cursor fell behind the retained records."""
 
 
 class EventIdConflictError(Exception):
@@ -418,14 +470,52 @@ class _Table:
     ``(effective_from_ms, label)`` points strictly ascending by
     ``effective_from_ms``; a point is effective until the key's next
     point, and points may be inserted out of order.
+
+    A table created with a positive ``cdc_retention`` additionally
+    publishes every state-changing write as a totally ordered sequence
+    of records, numbered by a ``seq`` that starts at 1 and never
+    regresses; only the newest ``cdc_retention`` records are retained.
     """
 
-    def __init__(self, event_time_versioned: bool = False) -> None:
+    def __init__(
+        self, event_time_versioned: bool = False, cdc_retention: int | None = None
+    ) -> None:
         self.event_time_versioned = event_time_versioned
+        # Maximum number of retained change records; None disables the
+        # table change feed entirely.
+        self.cdc_retention = cdc_retention
         # Current-value mode: key -> label.
         self.rows: dict[str, str] = {}
         # Versioned mode: key -> [(effective_from_ms, label), ...]
         self.versions: dict[str, list[tuple[int, str]]] = {}
+        # Change feed: the next record gets _latest_cdc_seq + 1;
+        # _cdc_changes holds at most cdc_retention records, oldest first.
+        self._latest_cdc_seq = 0
+        self._cdc_changes: list[dict] = []
+
+    def _append_cdc(
+        self, key: str, label: str, effective_from_ms: int | None = None
+    ) -> None:
+        """Publish one change record and trim to the retention cap.
+
+        Sequence numbers are handed out consecutively from 1 and never
+        regress; trimming only drops the oldest retained records.
+        """
+        if self.cdc_retention is None:
+            return
+        self._latest_cdc_seq += 1
+        record = {
+            "seq": self._latest_cdc_seq,
+            "kind": "upsert",
+            "key": key,
+            "label": label,
+        }
+        if effective_from_ms is not None:
+            record["effective_from_ms"] = effective_from_ms
+        self._cdc_changes.append(record)
+        overflow = len(self._cdc_changes) - self.cdc_retention
+        if overflow > 0:
+            del self._cdc_changes[:overflow]
 
     def put_version(self, key: str, label: str, effective_from_ms: int) -> bool:
         """Insert one version point; return True when the history changed.
@@ -2067,18 +2157,25 @@ class Service:
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
 
-    def create_table(self, name: str, event_time_versioned: bool = False) -> dict:
+    def create_table(
+        self,
+        name: str,
+        event_time_versioned: bool = False,
+        cdc_retention: int | None = None,
+    ) -> dict:
         with self._lock:
 
             def commit() -> None:
                 if name in self._tables:
                     raise TableExistsError(name)
-                self._tables[name] = _Table(event_time_versioned)
+                self._tables[name] = _Table(event_time_versioned, cdc_retention)
 
             self._commit_locked(commit)
         payload = {"table": name}
         if event_time_versioned:
             payload["event_time_versioned"] = True
+        if cdc_retention is not None:
+            payload["cdc_retention"] = cdc_retention
         return payload
 
     def table_features(self, name: str) -> dict | None:
@@ -2098,6 +2195,8 @@ class Service:
                     raise TableNotFoundError(table)
                 changed = target.rows.get(key) != label
                 target.rows[key] = label
+                if changed:
+                    target._append_cdc(key, label)
                 return changed
 
             changed = self._commit_locked(commit)
@@ -2118,7 +2217,10 @@ class Service:
                 target = self._tables.get(table)
                 if target is None:
                     raise TableNotFoundError(table)
-                return target.put_version(key, label, effective_from_ms)
+                changed = target.put_version(key, label, effective_from_ms)
+                if changed:
+                    target._append_cdc(key, label, effective_from_ms)
+                return changed
 
             changed = self._commit_locked(commit)
         return {
@@ -2363,13 +2465,52 @@ class Service:
             latest_seq = stream._latest_seq
         return {"stream": name, "latest_seq": latest_seq, "changes": records}
 
+    def table_changes(self, name: str, after_seq: int, limit: int) -> dict:
+        """Read retained table change records with ``seq`` greater than
+        ``after_seq``, ascending, at most ``limit`` of them.
+
+        The read happens under the service lock, so it only ever observes
+        complete commits, with the table state and its records in the
+        same order. A cursor past the latest sequence raises
+        CdcCursorAheadError; a cursor older than the oldest retained
+        record (so records were trimmed past it) raises
+        CdcCursorExpiredError.
+        """
+        with self._lock:
+            table = self._tables.get(name)
+            if table is None:
+                raise TableNotFoundError(name)
+            if table.cdc_retention is None:
+                raise CdcNotEnabledError(name)
+            if after_seq > table._latest_cdc_seq:
+                raise CdcCursorAheadError(
+                    f"cursor {after_seq} is ahead of latest_cdc_seq "
+                    f"{table._latest_cdc_seq}"
+                )
+            retained = table._cdc_changes
+            if retained and after_seq < retained[0]["seq"] - 1:
+                raise CdcCursorExpiredError(
+                    f"cursor {after_seq} is behind the oldest retained "
+                    f"record (seq {retained[0]['seq']})"
+                )
+            if retained:
+                offset = max(0, after_seq - retained[0]["seq"] + 1)
+                records = [dict(row) for row in retained[offset : offset + limit]]
+            else:
+                records = []
+            latest_cdc_seq = table._latest_cdc_seq
+        return {"table": name, "latest_seq": latest_cdc_seq, "changes": records}
+
     def snapshot(self) -> dict:
         """Return a consistent point-in-time, JSON-serializable snapshot.
 
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
         included or fully excluded. Instances with at least one
-        backpressured stream export ``format_version`` 6 (always carrying
+        CDC-enabled table export ``format_version`` 7 (always carrying
+        the ``tables`` array, and ``cdc_retention``/``latest_cdc_seq``/
+        ``cdc_changes`` on the enabled tables); otherwise instances with
+        at least one backpressured stream export ``format_version`` 6 (always carrying
         the ``tables`` array, and ``max_open_windows`` on the enabled
         streams); otherwise instances with at least one versioned
         dimension table export ``format_version`` 5 (always carrying
@@ -2390,6 +2531,14 @@ class Service:
             self._streams[name].to_snapshot() for name in sorted(self._streams)
         ]
         tables = [self._table_to_snapshot(name) for name in sorted(self._tables)]
+        if any(
+            table.cdc_retention is not None for table in self._tables.values()
+        ):
+            return {
+                "format_version": SNAPSHOT_FORMAT_VERSION_CDC,
+                "tables": tables,
+                "streams": streams,
+            }
         if any(
             stream.max_open_windows is not None
             for stream in self._streams.values()
@@ -2452,18 +2601,27 @@ class Service:
                             "effective_from_ms": effective_from_ms,
                         }
                     )
-            return {
+            entry = {
                 "name": name,
                 "event_time_versioned": True,
                 "versions": versions,
             }
-        return {
-            "name": name,
-            "rows": [
-                {"key": key, "label": table.rows[key]}
-                for key in sorted(table.rows)
-            ],
-        }
+        else:
+            entry = {
+                "name": name,
+                "rows": [
+                    {"key": key, "label": table.rows[key]}
+                    for key in sorted(table.rows)
+                ],
+            }
+        if table.cdc_retention is not None:
+            # CDC-enabled tables publish the config, the cursor and the
+            # retained records; only format_version 7 documents may carry
+            # these.
+            entry["cdc_retention"] = table.cdc_retention
+            entry["latest_cdc_seq"] = table._latest_cdc_seq
+            entry["cdc_changes"] = [dict(record) for record in table._cdc_changes]
+        return entry
 
     def restore_snapshot(self, document: object) -> int:
         """Replace instance state with a validated snapshot, atomically.
@@ -2484,6 +2642,9 @@ class Service:
         documents additionally restore open-window backpressure (the
         per-stream ``max_open_windows`` limit, with at least one enabled
         stream whose open base windows must not exceed it) under strict
+        validation; version 7 documents additionally restore table
+        change-data-capture feeds (retention, cursor and retained
+        records, with at least one enabled table) under strict
         validation. Returns the restored stream count.
         """
         with self._lock:
@@ -2523,6 +2684,7 @@ class Service:
             SNAPSHOT_FORMAT_VERSION_BATCHES,
             SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
             SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+            SNAPSHOT_FORMAT_VERSION_CDC,
         )
         if version == SNAPSHOT_FORMAT_VERSION:
             allowed = {"format_version", "streams"}
@@ -2553,8 +2715,10 @@ class Service:
                     in (
                         SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
                         SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                        SNAPSHOT_FORMAT_VERSION_CDC,
                     )
                 ),
+                allow_cdc=(version == SNAPSHOT_FORMAT_VERSION_CDC),
             )
 
         # Build and validate everything before the single publishing
@@ -2572,15 +2736,21 @@ class Service:
                     SNAPSHOT_FORMAT_VERSION_BATCHES,
                     SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
                     SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                    SNAPSHOT_FORMAT_VERSION_CDC,
                 ),
                 allow_batches=version
                 in (
                     SNAPSHOT_FORMAT_VERSION_BATCHES,
                     SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
                     SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                    SNAPSHOT_FORMAT_VERSION_CDC,
                 ),
                 allow_backpressure=(
-                    version == SNAPSHOT_FORMAT_VERSION_BACKPRESSURE
+                    version
+                    in (
+                        SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                        SNAPSHOT_FORMAT_VERSION_CDC,
+                    )
                 ),
             )
             if stream.name in restored:
@@ -2598,19 +2768,30 @@ class Service:
                 "format_version 6 requires at least one stream with "
                 "max_open_windows"
             )
+        if version == SNAPSHOT_FORMAT_VERSION_CDC and not any(
+            table.cdc_retention is not None for table in tables.values()
+        ):
+            raise SnapshotError(
+                "format_version 7 requires at least one table with cdc_retention"
+            )
         self._tables = tables
         self._streams = restored
         return len(restored)
 
     @staticmethod
-    def _parse_tables(value: object, allow_versioned: bool = False) -> dict:
+    def _parse_tables(
+        value: object, allow_versioned: bool = False, allow_cdc: bool = False
+    ) -> dict:
         """Validate the ``tables`` array of a snapshot document.
 
         Current-value tables carry ``name``/``rows``; versioned tables
-        (only accepted in a version 5 document) carry ``name``,
+        (only accepted in a version 5 or later document) carry ``name``,
         ``event_time_versioned: true`` and ``versions`` strictly ordered
-        by key then effective time. Nothing is repaired: any malformed
-        mode combination, duplicate or out-of-order point raises
+        by key then effective time. CDC-enabled tables (only accepted in
+        a version 7 document) additionally carry
+        ``cdc_retention``/``latest_cdc_seq``/``cdc_changes``. Nothing is
+        repaired: any malformed mode combination, duplicate or
+        out-of-order point, or inconsistent change record raises
         SnapshotError.
         """
         if not isinstance(value, list):
@@ -2623,6 +2804,8 @@ class Service:
             declared = {"name", "rows"}
             if allow_versioned:
                 declared |= {"event_time_versioned", "versions"}
+            if allow_cdc:
+                declared |= {"cdc_retention", "latest_cdc_seq", "cdc_changes"}
             extra = sorted(set(entry) - declared)
             if extra:
                 raise SnapshotError(f"table entry has unexpected field: {extra[0]}")
@@ -2662,7 +2845,139 @@ class Service:
                         f"table entry missing required field: rows"
                     )
                 tables[name] = Service._parse_current_table(name, entry["rows"])
+            # The CDC triple must appear together (only possible when
+            # allow_cdc declared the fields); a table without
+            # cdc_retention restores as a table without a change feed.
+            if "cdc_retention" in entry:
+                Service._load_table_cdc(name, tables[name], entry)
+            else:
+                for field in ("latest_cdc_seq", "cdc_changes"):
+                    if field in entry:
+                        raise SnapshotError(
+                            f"table {name!r}: {field} present without "
+                            f"cdc_retention"
+                        )
         return tables
+
+    @staticmethod
+    def _load_table_cdc(name: str, table: "_Table", entry: dict) -> None:
+        """Validate and attach the retained change feed of one table entry.
+
+        The retained records must be exactly the tail of the sequence a
+        live instance would hold: consecutive sequence numbers ending at
+        ``latest_cdc_seq``, at most ``cdc_retention`` of them (and
+        exactly that many once the sequence has grown past the cap),
+        shaped after the table's mode, and consistent with the current
+        rows or version points — a current-value record's key must exist
+        and the last retained record of every key must match the stored
+        label, and a versioned record must name an existing version point
+        with the same label.
+        """
+        retention = entry["cdc_retention"]
+        if not _is_int(retention) or retention <= 0:
+            raise SnapshotError(
+                f"table {name!r}: cdc_retention must be a positive integer"
+            )
+        for field in ("latest_cdc_seq", "cdc_changes"):
+            if field not in entry:
+                raise SnapshotError(
+                    f"table entry missing required field: {field}"
+                )
+        latest = entry["latest_cdc_seq"]
+        if not _is_int(latest) or latest < 0:
+            raise SnapshotError(
+                f"table {name!r}: latest_cdc_seq must be a non-negative integer"
+            )
+        records = entry["cdc_changes"]
+        if not isinstance(records, list):
+            raise SnapshotError(f"table {name!r}: cdc_changes must be an array")
+        if len(records) != min(latest, retention):
+            raise SnapshotError(
+                f"table {name!r}: retained cdc_changes are inconsistent with "
+                f"latest_cdc_seq {latest} and cdc_retention {retention}"
+            )
+        fields = {"seq", "kind", "key", "label"}
+        if table.event_time_versioned:
+            fields |= {"effective_from_ms"}
+        parsed: list[dict] = []
+        previous_seq: int | None = None
+        last_by_key: dict[str, dict] = {}
+        for raw in records:
+            if not isinstance(raw, dict):
+                raise SnapshotError(
+                    f"table {name!r}: cdc_changes entries must be objects"
+                )
+            extra = sorted(set(raw) - fields)
+            if extra:
+                raise SnapshotError(
+                    f"table {name!r}: cdc record has unexpected field: {extra[0]}"
+                )
+            missing = sorted(fields - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"table {name!r}: cdc record missing field: {missing[0]}"
+                )
+            seq = raw["seq"]
+            if not _is_int(seq) or seq <= 0:
+                raise SnapshotError(
+                    f"table {name!r}: cdc record seq must be a positive integer"
+                )
+            if previous_seq is not None and seq != previous_seq + 1:
+                raise SnapshotError(
+                    f"table {name!r}: cdc_changes must have consecutive "
+                    f"sequence numbers"
+                )
+            previous_seq = seq
+            if raw["kind"] != "upsert":
+                raise SnapshotError(
+                    f"table {name!r}: cdc record kind must be 'upsert'"
+                )
+            key = raw["key"]
+            label = raw["label"]
+            if not isinstance(key, str) or not key:
+                raise SnapshotError(
+                    f"table {name!r}: cdc record key must be a non-empty string"
+                )
+            if not isinstance(label, str) or not label:
+                raise SnapshotError(
+                    f"table {name!r}: cdc record label must be a non-empty string"
+                )
+            record = {"seq": seq, "kind": "upsert", "key": key, "label": label}
+            if table.event_time_versioned:
+                effective_from_ms = raw["effective_from_ms"]
+                if not _is_int(effective_from_ms):
+                    raise SnapshotError(
+                        f"table {name!r}: cdc record effective_from_ms must be "
+                        f"an integer"
+                    )
+                point = (effective_from_ms, label)
+                if point not in table.versions.get(key, []):
+                    raise SnapshotError(
+                        f"table {name!r}: cdc record contradicts the version "
+                        f"timeline of key {key!r}"
+                    )
+                record["effective_from_ms"] = effective_from_ms
+            elif key not in table.rows:
+                raise SnapshotError(
+                    f"table {name!r}: cdc record references unknown key {key!r}"
+                )
+            parsed.append(record)
+            last_by_key[key] = record
+        if parsed and parsed[-1]["seq"] != latest:
+            raise SnapshotError(
+                f"table {name!r}: latest_cdc_seq {latest} does not match the "
+                f"newest retained record"
+            )
+        if not table.event_time_versioned:
+            for key, record in last_by_key.items():
+                if table.rows[key] != record["label"]:
+                    raise SnapshotError(
+                        f"table {name!r}: last retained cdc record of key "
+                        f"{key!r} does not match the current row"
+                    )
+        table.cdc_retention = retention
+        table._latest_cdc_seq = latest
+        table._cdc_changes = parsed
 
     @staticmethod
     def _parse_current_table(name: str, raw_rows: object) -> _Table:

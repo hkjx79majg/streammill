@@ -13,6 +13,9 @@ from .service import (
     BackpressureNotEnabledError,
     BatchIdConflictError,
     BatchIngestNotEnabledError,
+    CdcCursorAheadError,
+    CdcCursorExpiredError,
+    CdcNotEnabledError,
     ChangeCursorAheadError,
     ChangeCursorExpiredError,
     ChangeFeedNotEnabledError,
@@ -103,6 +106,7 @@ _TABLE_FIELDS = {
 }
 _TABLE_OPTIONAL_FIELDS = {
     "event_time_versioned": lambda v: isinstance(v, bool),
+    "cdc_retention": lambda v: _is_int(v) and v > 0,
 }
 _ROW_FIELDS = {
     "key": lambda v: isinstance(v, str) and len(v) > 0,
@@ -203,6 +207,12 @@ class Handler(BaseHTTPRequestHandler):
             except _RequestError as exc:
                 self.send_error_json(exc.status, exc.code, exc.message)
             return
+        if len(segments) == 3 and segments[0] == "tables" and segments[2] == "changes":
+            try:
+                self._get_table_changes(segments[1])
+            except _RequestError as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+            return
         if len(segments) == 3 and segments[0] == "streams" and segments[2] == "pressure":
             try:
                 self.send_json(200, self.service.pressure(segments[1]))
@@ -287,7 +297,9 @@ class Handler(BaseHTTPRequestHandler):
         values = _validate(self._read_json(), _TABLE_FIELDS, _TABLE_OPTIONAL_FIELDS)
         try:
             payload = self.service.create_table(
-                values["name"], values.get("event_time_versioned", False)
+                values["name"],
+                values.get("event_time_versioned", False),
+                values.get("cdc_retention"),
             )
         except TableExistsError:
             raise _RequestError(409, "table_exists", f"table already exists: {values['name']}") from None
@@ -432,7 +444,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, payload)
 
     def _changes_params(self) -> tuple[int, int]:
-        """Validate the after_seq/limit query pair of the changes route."""
+        """Validate the after_seq/limit query pair of the changes routes."""
         pairs = parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
         names = sorted(key for key, _ in pairs)
         if len(pairs) != 2 or names != ["after_seq", "limit"]:
@@ -447,6 +459,29 @@ class Handler(BaseHTTPRequestHandler):
         if not 1 <= limit <= 1000:
             raise _invalid_request("limit must be between 1 and 1000")
         return after_seq, limit
+
+    def _get_table_changes(self, name: str) -> None:
+        # Query-parameter validation runs before the table existence
+        # check, matching the stream changes route's 422-before-404
+        # ordering.
+        after_seq, limit = self._changes_params()
+        try:
+            payload = self.service.table_changes(name, after_seq, limit)
+        except TableNotFoundError:
+            raise _RequestError(404, "table_not_found", f"unknown table: {name}") from None
+        except CdcNotEnabledError:
+            raise _RequestError(
+                409, "cdc_not_enabled", f"table has no change feed: {name}"
+            ) from None
+        except CdcCursorAheadError:
+            raise _RequestError(
+                409, "cdc_cursor_ahead", f"cursor is past the latest seq: {after_seq}"
+            ) from None
+        except CdcCursorExpiredError:
+            raise _RequestError(
+                410, "cdc_cursor_expired", f"cursor is behind the retained records: {after_seq}"
+            ) from None
+        self.send_json(200, payload)
 
     @staticmethod
     def _query_int(field: str, raw: str) -> int:
