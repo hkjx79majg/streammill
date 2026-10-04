@@ -84,6 +84,14 @@ PYTHONPATH=src python3 -m streammill.server --host 127.0.0.1 --port 8080
 - `lookup_table` 引用版本维表的连接流中，每个事件以自身 `timestamp_ms` 选择不晚于该时间的最新版本参与分组聚合；键不存在或事件时间早于该键首个版本返回 409 `lookup_version_not_found`，聚合、去重、水位线、变更序号与批次均不变。之后补写的维度历史只影响事件时间不早于它的事件，不重算已接收事件。去重内容仍包含 `lookup_key`；批次中任一元素找不到版本时整批回滚，失败请求不占用 `batch_id`。
 - 只要存在版本维表，`GET /snapshot` 即导出 `format_version: 5`（始终携带 `tables` 数组）：版本维表对象携带 `event_time_versioned: true` 与 `versions`（`key`、`label`、`effective_from_ms`），版本点按 `key`、`effective_from_ms` 严格升序；当前值维表保持 `rows` 形状，流对象字段与 version 4 相同。恢复兼容 version 1 至 4，并严格校验 version 5：模式字段组合错误（`rows` 与版本标记混用、`versions` 缺少标记或标记非 `true`）、重复或乱序版本点、无效生效时间及同一点冲突均返回 422 `invalid_snapshot` 且不发布部分状态；恢复后按事件时间的连接解析、批次重放与变更游标与未中断实例一致。普通维表、未连接流、已有结果与 joined-results 排序、迟到与自动水位线规则、去重淘汰、变更流游标、批次重放、健康检查及既有错误优先级均保持不变。
 
+## 可选的按流开放窗口背压
+
+- `POST /streams` 可额外携带 `max_open_windows`（正整数），限定该流同时开放的基础窗口数并在创建响应中回显；不提供时创建、事件、批次、水位线、快照与持久化行为与既有基线完全一致。类型或范围不合法返回 422 `invalid_request`，流不会被创建。
+- 开放窗口仅统计尚未最终化的基础窗口：滑动流的每个重叠窗口分别计数，连接分组、最终结果与变更记录均不占名额。`GET /streams/{name}/pressure` 在启用后返回 `{"stream", "max_open_windows", "open_windows", "available_windows"}`；未知流返回 404 `stream_not_found`，未启用的流返回 409 `backpressure_not_enabled`。
+- 单事件仍先执行既有字段校验、去重、迟到判断与维表解析：精确重复与过迟丢弃不创建窗口并保持原成功结果，标识冲突或维度缺失仍返回原有 409。其余事件按完成聚合及自动水位线推进后的状态计算开放窗口数，超过上限时返回 429 `stream_backpressured`，并回滚该事件触及的全部状态（聚合、去重记录、最大事件时间、水位线、最终结果、变更序号与持久化状态）。手工推进水位线可最终化窗口并立即释放名额。
+- 批次按输入顺序执行相同检查，任一元素超限则整体返回 429 `stream_backpressured`，原子回滚且不占用 `batch_id`。并发写入按既有提交全序争用名额，成功响应后的开放窗口数不超过上限。
+- 任一流启用该功能时 `GET /snapshot` 导出 `format_version: 6`（始终携带 `tables` 数组），对应流额外携带 `max_open_windows`；均未启用时继续导出既有版本与文档形状。恢复兼容 version 1 至 5；version 6 至少一条流须携带正整数 `max_open_windows`，旧版本文档不得携带该字段，且启用流的开放基础窗口数不得超过上限，任一违规返回 422 `invalid_snapshot` 且实例保持为空。恢复后的压力查询、名额释放、批次回滚、变更序号与后续写入与未中断实例一致，本地持久化原子保存配置与状态。除新增 429 情形外，健康检查、结果查询、连接、变更游标、旧快照恢复以及未启用流的响应与错误优先级不变。
+
 ## 可选的本地状态文件持久化
 
 - 设置环境变量 `STREAMMILL_STATE_FILE` 为非空文件路径即启用持久化；未设置时服务保持纯内存行为，所有接口、响应与错误优先级完全不变。启用后不改变任何 HTTP 入口。

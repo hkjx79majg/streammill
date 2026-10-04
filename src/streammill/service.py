@@ -224,6 +224,45 @@ fails at runtime the in-memory state is rolled back to the pre-commit
 snapshot, the file keeps the previous complete commit, and
 StatePersistError is raised (HTTP 503 ``state_persist_failed``), so a
 retry is processed exactly as if the request had never happened.
+
+Streams may optionally bound their simultaneously open windows by
+passing a positive ``max_open_windows`` at creation time (echoed in the
+create response; without it the stream behaves exactly as before). Only
+base windows that are not yet finalized occupy slots — sliding windows
+count separately, joined groups, finalized results and change records
+never do:
+
+* single events still run the usual validation, dedup, lateness and
+  dimension-resolution steps first; exact duplicates and too-late drops
+  create no windows and keep their original successful outcomes. Any
+  other event is aggregated (and, on automatic streams, the watermark
+  advance runs) and the resulting open-window count is compared against
+  the limit; over the limit the event is rejected with
+  StreamBackpressuredError (HTTP 429 ``stream_backpressured``) and every
+  state it touched — aggregates, dedup record, maximum event timestamp,
+  watermark, finalized results, change sequence and persisted state —
+  is rolled back;
+* batches apply the same check per element in input order; the first
+  element over the limit fails the whole batch with 429
+  ``stream_backpressured``, rolls every element back atomically and
+  does not occupy the ``batch_id``;
+* advancing the watermark finalizes windows and frees their slots
+  immediately, so a manual advance always relieves pressure;
+* ``Service.pressure`` reports the configured limit, the current open
+  base windows and the remaining slots (HTTP 404 ``stream_not_found``
+  for unknown streams, 409 ``backpressure_not_enabled`` on streams
+  without a limit).
+
+Instances with at least one backpressured stream export snapshots as
+``format_version`` 6, which always carries the ``tables`` array and, on
+enabled streams, ``max_open_windows``. Restore stays compatible with
+versions 1 to 5; a version 6 document must carry the limit on at least
+one stream (older versions must not carry it at all) and no enabled
+stream's open base windows may exceed its limit — any violation raises
+SnapshotError and leaves the instance empty. After a restore the
+pressure query, slot release, batch rollback, change sequence and
+subsequent writes behave exactly as on the uninterrupted instance, and
+local persistence saves the configuration and state atomically.
 """
 
 from __future__ import annotations
@@ -243,6 +282,7 @@ SNAPSHOT_FORMAT_VERSION_JOIN = 2
 SNAPSHOT_FORMAT_VERSION_CHANGES = 3
 SNAPSHOT_FORMAT_VERSION_BATCHES = 4
 SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES = 5
+SNAPSHOT_FORMAT_VERSION_BACKPRESSURE = 6
 
 
 class StreamExistsError(Exception):
@@ -299,6 +339,14 @@ class BatchIdConflictError(Exception):
 
 class WatermarkRegressionError(Exception):
     """Raised when a new watermark would move the stream backwards."""
+
+
+class StreamBackpressuredError(Exception):
+    """Raised when an accepted write would exceed the open-window limit."""
+
+
+class BackpressureNotEnabledError(Exception):
+    """Raised when querying pressure of a stream without an open-window limit."""
 
 
 class EventIdConflictError(Exception):
@@ -432,6 +480,7 @@ class _Stream:
         lookup_table: str | None = None,
         change_retention: int | None = None,
         batch_retention: int | None = None,
+        max_open_windows: int | None = None,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
@@ -449,6 +498,9 @@ class _Stream:
         # Maximum number of retained batch records; None disables batch
         # ingestion entirely.
         self.batch_retention = batch_retention
+        # Maximum number of simultaneously open base windows; None
+        # disables open-window backpressure entirely.
+        self.max_open_windows = max_open_windows
         self.watermark: int | None = None
         # Maximum timestamp_ms of a successfully accepted event; only
         # maintained on automatic streams, None until the first such event.
@@ -538,6 +590,7 @@ class _Stream:
                     outcome.update(watermark_ms=self.watermark, finalized=[])
                 return outcome
             label = self._resolve_label(label_of, lookup_key, timestamp_ms)
+            backup = self._pressure_backup()
             self._aggregate(timestamp_ms, value, lookup_key, label)
             self._dedup[event_id] = (
                 (timestamp_ms, value, lookup_key)
@@ -552,12 +605,45 @@ class _Stream:
                     outcome.update(watermark_ms=self.watermark, finalized=[])
                 return outcome
             label = self._resolve_label(label_of, lookup_key, timestamp_ms)
+            backup = self._pressure_backup()
             self._aggregate(timestamp_ms, value, lookup_key, label)
             outcome = {"dropped": False}
         if automatic:
             newly = self._note_accepted_event(timestamp_ms)
             outcome.update(watermark_ms=self.watermark, finalized=newly)
+        self._enforce_open_window_limit(backup)
         return outcome
+
+    def _pressure_backup(self) -> tuple | None:
+        """Pre-mutation state for the open-window limit, when enabled."""
+        if self.max_open_windows is None:
+            return None
+        return self._state_backup()
+
+    def _open_window_count(self) -> int:
+        """Base windows not yet finalized; nothing else occupies slots."""
+        return sum(
+            1 for start in self._windows if start not in self._finalized_starts
+        )
+
+    def _enforce_open_window_limit(self, backup: tuple | None) -> None:
+        """Reject the just-processed event when it exceeds the limit.
+
+        The count is taken after aggregation and the automatic watermark
+        advance, so windows the advance finalized already freed their
+        slots. Over the limit the whole event is rolled back — aggregates,
+        dedup record, maximum event timestamp, watermark, finalized
+        results and change sequence — and StreamBackpressuredError is
+        raised, leaving the stream exactly as before the event.
+        """
+        if backup is None:
+            return
+        if self._open_window_count() > self.max_open_windows:
+            self._state_restore(backup)
+            raise StreamBackpressuredError(
+                f"stream {self.name!r} exceeds max_open_windows "
+                f"{self.max_open_windows}"
+            )
 
     def apply_batch(self, events: list[dict], label_of=None) -> list[dict]:
         """Apply a whole batch atomically, in input order.
@@ -566,10 +652,11 @@ class _Stream:
         dedup, lateness, lookup, window, automatic-watermark,
         finalization and change-feed semantics are identical to posting
         the events one by one; each element observes the state left by
-        the previous ones. The first EventIdConflictError or
-        LookupKeyNotFoundError rolls every mutation back — aggregates,
-        dedup records, watermark, finalized results, joined groups and
-        the change sequence — so a failed batch leaves no trace.
+        the previous ones. The first EventIdConflictError,
+        LookupKeyNotFoundError or StreamBackpressuredError rolls every
+        mutation back — aggregates, dedup records, watermark, finalized
+        results, joined groups and the change sequence — so a failed
+        batch leaves no trace.
         """
         backup = self._state_backup()
         outcomes: list[dict] = []
@@ -826,6 +913,10 @@ class _Stream:
             # documents may carry these.
             entry["batch_retention"] = self.batch_retention
             entry["batches"] = copy.deepcopy(self._batches)
+        if self.max_open_windows is not None:
+            # Backpressured streams publish the open-window limit; only
+            # format_version 6 documents may carry it.
+            entry["max_open_windows"] = self.max_open_windows
         return entry
 
     @classmethod
@@ -835,6 +926,7 @@ class _Stream:
         table_names: set[str] | None = None,
         allow_change_feed: bool = False,
         allow_batches: bool = False,
+        allow_backpressure: bool = False,
     ) -> "_Stream":
         """Rebuild one stream from a snapshot entry or raise SnapshotError.
 
@@ -847,7 +939,9 @@ class _Stream:
         only accepted when ``allow_change_feed`` is set (a version 3
         document). Batch fields (``batch_retention``, ``batches``) are
         only accepted when ``allow_batches`` is set (a version 4
-        document).
+        document). The backpressure field (``max_open_windows``) is only
+        accepted when ``allow_backpressure`` is set (a version 6
+        document), and the restored open base windows must not exceed it.
         """
         if not isinstance(data, dict):
             raise SnapshotError("stream entry must be an object")
@@ -870,6 +964,8 @@ class _Stream:
             allowed |= {"change_retention", "latest_seq", "changes"}
         if allow_batches:
             allowed |= {"batch_retention", "batches"}
+        if allow_backpressure:
+            allowed |= {"max_open_windows"}
         extra = sorted(set(data) - allowed)
         if extra:
             raise SnapshotError(f"stream entry has unexpected field: {extra[0]}")
@@ -1014,6 +1110,16 @@ class _Stream:
                 f"stream {name!r}: batches present without batch_retention"
             )
 
+        # The open-window limit stands alone; a document without it
+        # restores as a stream without backpressure.
+        max_open_windows = data.get("max_open_windows")
+        if "max_open_windows" in data and (
+            not _is_int(max_open_windows) or max_open_windows <= 0
+        ):
+            raise SnapshotError(
+                f"stream {name!r}: max_open_windows must be a positive integer"
+            )
+
         stream = cls(
             name,
             window_ms,
@@ -1024,6 +1130,7 @@ class _Stream:
             lookup_table,
             change_retention,
             batch_retention,
+            max_open_windows,
         )
         stream.watermark = watermark
         stream.max_event_timestamp = max_event_timestamp
@@ -1074,6 +1181,14 @@ class _Stream:
                     f"at watermark {watermark}"
                 )
             stream._windows[start] = [row["count"], row["sum"]]
+
+        if max_open_windows is not None and (
+            stream._open_window_count() > max_open_windows
+        ):
+            raise SnapshotError(
+                f"stream {name!r}: open windows exceed max_open_windows "
+                f"{max_open_windows}"
+            )
 
         if lookup_table is not None:
             cls._load_joined_state(stream, data, name, window_ms)
@@ -2025,6 +2140,7 @@ class Service:
         lookup_table: str | None = None,
         change_retention: int | None = None,
         batch_retention: int | None = None,
+        max_open_windows: int | None = None,
     ) -> dict:
         with self._lock:
 
@@ -2043,6 +2159,7 @@ class Service:
                     lookup_table,
                     change_retention,
                     batch_retention,
+                    max_open_windows,
                 )
 
             self._commit_locked(commit)
@@ -2063,6 +2180,8 @@ class Service:
             payload["change_retention"] = change_retention
         if batch_retention is not None:
             payload["batch_retention"] = batch_retention
+        if max_open_windows is not None:
+            payload["max_open_windows"] = max_open_windows
         return payload
 
     def stream_features(self, name: str) -> dict | None:
@@ -2190,6 +2309,27 @@ class Service:
             rows = [dict(row) for row in stream._joined_finalized]
         return {"stream": name, "results": rows}
 
+    def pressure(self, name: str) -> dict:
+        """Open-window pressure of a backpressured stream.
+
+        Only base windows that are not yet finalized occupy slots —
+        sliding windows count separately, joined groups, finalized
+        results and change records never do. The read happens under the
+        service lock, so it only ever observes complete commits.
+        """
+        with self._lock:
+            stream = self._get(name)
+            if stream.max_open_windows is None:
+                raise BackpressureNotEnabledError(name)
+            open_windows = stream._open_window_count()
+            max_open_windows = stream.max_open_windows
+        return {
+            "stream": name,
+            "max_open_windows": max_open_windows,
+            "open_windows": open_windows,
+            "available_windows": max_open_windows - open_windows,
+        }
+
     def changes(self, name: str, after_seq: int, limit: int) -> dict:
         """Read retained change-feed records with ``seq`` greater than
         ``after_seq``, ascending, at most ``limit`` of them.
@@ -2228,9 +2368,12 @@ class Service:
 
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
-        included or fully excluded. Instances with at least one versioned
-        dimension table export ``format_version`` 5 (always carrying the
-        ``tables`` array with each table's mode, versioned rows ordered by
+        included or fully excluded. Instances with at least one
+        backpressured stream export ``format_version`` 6 (always carrying
+        the ``tables`` array, and ``max_open_windows`` on the enabled
+        streams); otherwise instances with at least one versioned
+        dimension table export ``format_version`` 5 (always carrying
+        the ``tables`` array with each table's mode, versioned rows ordered by
         key then effective time); otherwise instances with at least one
         batch-enabled stream export ``format_version`` 4, instances with
         at least one change-feed stream export ``format_version`` 3,
@@ -2247,6 +2390,15 @@ class Service:
             self._streams[name].to_snapshot() for name in sorted(self._streams)
         ]
         tables = [self._table_to_snapshot(name) for name in sorted(self._tables)]
+        if any(
+            stream.max_open_windows is not None
+            for stream in self._streams.values()
+        ):
+            return {
+                "format_version": SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                "tables": tables,
+                "streams": streams,
+            }
         if any(
             table.event_time_versioned for table in self._tables.values()
         ):
@@ -2328,8 +2480,11 @@ class Service:
         retained batch records, so replay and eviction continue exactly
         as on the uninterrupted instance); version 5 documents
         additionally restore event-time versioned tables (mode markers
-        and version timelines) under strict validation. Returns the
-        restored stream count.
+        and version timelines) under strict validation; version 6
+        documents additionally restore open-window backpressure (the
+        per-stream ``max_open_windows`` limit, with at least one enabled
+        stream whose open base windows must not exceed it) under strict
+        validation. Returns the restored stream count.
         """
         with self._lock:
             # Conflict takes priority over every content check: an instance
@@ -2367,6 +2522,7 @@ class Service:
             SNAPSHOT_FORMAT_VERSION_CHANGES,
             SNAPSHOT_FORMAT_VERSION_BATCHES,
             SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+            SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
         )
         if version == SNAPSHOT_FORMAT_VERSION:
             allowed = {"format_version", "streams"}
@@ -2393,7 +2549,11 @@ class Service:
             tables = self._parse_tables(
                 document["tables"],
                 allow_versioned=(
-                    version == SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES
+                    version
+                    in (
+                        SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+                        SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                    )
                 ),
             )
 
@@ -2411,11 +2571,16 @@ class Service:
                     SNAPSHOT_FORMAT_VERSION_CHANGES,
                     SNAPSHOT_FORMAT_VERSION_BATCHES,
                     SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+                    SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
                 ),
                 allow_batches=version
                 in (
                     SNAPSHOT_FORMAT_VERSION_BATCHES,
                     SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
+                    SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
+                ),
+                allow_backpressure=(
+                    version == SNAPSHOT_FORMAT_VERSION_BACKPRESSURE
                 ),
             )
             if stream.name in restored:
@@ -2426,6 +2591,13 @@ class Service:
                 raise SnapshotError("streams must be strictly ordered by name")
             previous_name = stream.name
             restored[stream.name] = stream
+        if version == SNAPSHOT_FORMAT_VERSION_BACKPRESSURE and not any(
+            stream.max_open_windows is not None for stream in restored.values()
+        ):
+            raise SnapshotError(
+                "format_version 6 requires at least one stream with "
+                "max_open_windows"
+            )
         self._tables = tables
         self._streams = restored
         return len(restored)
