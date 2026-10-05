@@ -21,6 +21,8 @@ from .service import (
     ChangeFeedNotEnabledError,
     DimensionVersionConflictError,
     EventIdConflictError,
+    FeatureNotFoundError,
+    FeatureStoreNotEnabledError,
     JoinNotEnabledError,
     LookupKeyNotFoundError,
     LookupVersionNotFoundError,
@@ -90,6 +92,7 @@ _CREATE_OPTIONAL_FIELDS = {
     "change_retention": lambda v: _is_int(v) and v > 0,
     "batch_retention": lambda v: _is_int(v) and v > 0,
     "max_open_windows": lambda v: _is_int(v) and v > 0,
+    "online_feature_store": lambda v: isinstance(v, bool),
 }
 _EVENT_FIELDS = {
     "timestamp_ms": _is_int,
@@ -224,6 +227,22 @@ class Handler(BaseHTTPRequestHandler):
                     f"stream has no max_open_windows: {segments[1]}",
                 )
             return
+        if len(segments) == 4 and segments[0] == "streams" and segments[2] == "features":
+            try:
+                self.send_json(200, self.service.feature(segments[1], segments[3]))
+            except StreamNotFoundError:
+                self.send_error_json(404, "stream_not_found", f"unknown stream: {segments[1]}")
+            except FeatureStoreNotEnabledError:
+                self.send_error_json(
+                    409, "feature_store_not_enabled",
+                    f"stream has no online feature store: {segments[1]}",
+                )
+            except FeatureNotFoundError:
+                self.send_error_json(
+                    404, "feature_not_found",
+                    f"no stored feature for lookup_key: {segments[3]}",
+                )
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
@@ -272,6 +291,11 @@ class Handler(BaseHTTPRequestHandler):
             raise _invalid_request(
                 "slide_ms must be no larger than window_ms and evenly divide it"
             )
+        online_feature_store = values.get("online_feature_store", False)
+        if online_feature_store and values.get("lookup_table") is None:
+            raise _invalid_request(
+                "online_feature_store requires lookup_table"
+            )
         try:
             payload = self.service.create_stream(
                 values["name"],
@@ -284,6 +308,7 @@ class Handler(BaseHTTPRequestHandler):
                 values.get("change_retention"),
                 values.get("batch_retention"),
                 values.get("max_open_windows"),
+                online_feature_store,
             )
         except StreamExistsError:
             raise _RequestError(409, "stream_exists", f"stream already exists: {values['name']}") from None

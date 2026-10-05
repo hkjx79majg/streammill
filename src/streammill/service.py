@@ -304,6 +304,41 @@ record contradicting the current rows or version points) — any
 violation raises SnapshotError without publishing state. After a
 restore the cursor, the next sequence number, trimming and persistence
 commits behave exactly as on the uninterrupted instance.
+
+Streams created with a ``lookup_table`` may additionally enable an
+online feature store by passing ``online_feature_store: true`` at
+creation time (echoed in the create response; ``false`` is exactly
+equivalent to omitting the field, and the flag without a lookup table
+is rejected with ``invalid_request`` without creating the stream). On
+such streams every successfully received event also records, under its
+``lookup_key``, the label resolved at receive time together with the
+event's ``timestamp_ms`` and ``value``: a larger timestamp replaces the
+stored entry, and between equal timestamps the later commit in the
+atomic commit order wins. An older event that is still accepted into
+the windows never rolls a newer feature back, and later table writes
+or backfills never recompute an already stored label. Dropped,
+duplicate or rejected events never touch the store, and batches update
+it in input order atomically with the aggregates, dedup records,
+watermark and change sequence — a failed batch rolls the feature
+writes back with everything else, so other requests only ever observe
+the state before or after the whole batch.
+
+``Service.feature`` returns the stored entry of one lookup key
+(``stream``/``lookup_key``/``label``/``timestamp_ms``/``value``);
+unknown streams raise StreamNotFoundError, streams without the store
+raise FeatureStoreNotEnabledError and keys without a stored feature
+raise FeatureNotFoundError. Instances with at least one enabled stream
+export snapshots as ``format_version`` 8, which always carries the
+``tables`` array and, on enabled streams, ``online_feature_store:
+true`` plus ``online_features`` strictly ordered by ``lookup_key``,
+each entry carrying exactly ``lookup_key``/``label``/``timestamp_ms``
+and a finite ``value``. Restore stays compatible with versions 1 to 7;
+a version 8 document must enable the store on at least one stream,
+enabled streams must reference a restored table, and malformed fields,
+types, values, key orderings or feature-store fields on older versions
+all raise SnapshotError without publishing state. After a restore,
+reads, overwrites, batches, snapshots and state-file restarts behave
+exactly as on the uninterrupted instance.
 """
 
 from __future__ import annotations
@@ -325,6 +360,7 @@ SNAPSHOT_FORMAT_VERSION_BATCHES = 4
 SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES = 5
 SNAPSHOT_FORMAT_VERSION_BACKPRESSURE = 6
 SNAPSHOT_FORMAT_VERSION_TABLE_CDC = 7
+SNAPSHOT_FORMAT_VERSION_FEATURES = 8
 
 
 class StreamExistsError(Exception):
@@ -401,6 +437,14 @@ class CdcCursorAheadError(Exception):
 
 class CdcCursorExpiredError(Exception):
     """Raised when a table CDC cursor fell behind the retained records."""
+
+
+class FeatureStoreNotEnabledError(Exception):
+    """Raised when reading features of a stream without the online store."""
+
+
+class FeatureNotFoundError(Exception):
+    """Raised when no feature is stored for the requested lookup key."""
 
 
 class EventIdConflictError(Exception):
@@ -586,6 +630,7 @@ class _Stream:
         change_retention: int | None = None,
         batch_retention: int | None = None,
         max_open_windows: int | None = None,
+        online_feature_store: bool = False,
     ) -> None:
         self.name = name
         self.window_ms = window_ms
@@ -606,6 +651,9 @@ class _Stream:
         # Maximum number of simultaneously open base windows; None
         # disables open-window backpressure entirely.
         self.max_open_windows = max_open_windows
+        # Whether accepted events also upsert a per-lookup-key online
+        # feature; only meaningful on joined streams.
+        self.online_feature_store = online_feature_store
         self.watermark: int | None = None
         # Maximum timestamp_ms of a successfully accepted event; only
         # maintained on automatic streams, None until the first such event.
@@ -629,6 +677,9 @@ class _Stream:
         # Retained batch records in commit order, at most batch_retention
         # of them; each is {"batch_id", "request", "response"}.
         self._batches: list[dict] = []
+        # Online feature store: lookup_key -> {"label", "timestamp_ms",
+        # "value"} of the newest committed accepted event for that key.
+        self._features: dict[str, dict] = {}
 
     @property
     def _step_ms(self) -> int:
@@ -697,6 +748,7 @@ class _Stream:
             label = self._resolve_label(label_of, lookup_key, timestamp_ms)
             backup = self._pressure_backup()
             self._aggregate(timestamp_ms, value, lookup_key, label)
+            self._note_feature(lookup_key, label, timestamp_ms, value)
             self._dedup[event_id] = (
                 (timestamp_ms, value, lookup_key)
                 if joined
@@ -712,6 +764,7 @@ class _Stream:
             label = self._resolve_label(label_of, lookup_key, timestamp_ms)
             backup = self._pressure_backup()
             self._aggregate(timestamp_ms, value, lookup_key, label)
+            self._note_feature(lookup_key, label, timestamp_ms, value)
             outcome = {"dropped": False}
         if automatic:
             newly = self._note_accepted_event(timestamp_ms)
@@ -794,6 +847,7 @@ class _Stream:
             copy.deepcopy(self._joined_finalized),
             self._latest_seq,
             copy.deepcopy(self._changes),
+            copy.deepcopy(self._features),
         )
 
     def _state_restore(self, backup: tuple) -> None:
@@ -808,6 +862,7 @@ class _Stream:
             self._joined_finalized,
             self._latest_seq,
             self._changes,
+            self._features,
         ) = backup
 
     def _resolve_label(self, label_of, lookup_key: str | None, timestamp_ms: int):
@@ -840,6 +895,28 @@ class _Stream:
             # eviction behave exactly like a manual advance.
             return self.advance_watermark(target)
         return []
+
+    def _note_feature(
+        self, lookup_key: str | None, label: str | None, timestamp_ms: int, value: float
+    ) -> None:
+        """Upsert the online feature of one lookup key, when enabled.
+
+        Only successfully received events reach this point. A larger
+        timestamp replaces the stored entry and between equal timestamps
+        the later commit wins, so an older event that is still accepted
+        into the windows never rolls a newer feature back. The label is
+        the one resolved at receive time; later table writes never
+        recompute it.
+        """
+        if not self.online_feature_store:
+            return
+        existing = self._features.get(lookup_key)
+        if existing is None or timestamp_ms >= existing["timestamp_ms"]:
+            self._features[lookup_key] = {
+                "label": label,
+                "timestamp_ms": timestamp_ms,
+                "value": value,
+            }
 
     def _aggregate(
         self,
@@ -1022,6 +1099,20 @@ class _Stream:
             # Backpressured streams publish the open-window limit; only
             # format_version 6 documents may carry it.
             entry["max_open_windows"] = self.max_open_windows
+        if self.online_feature_store:
+            # Feature-store streams publish the flag plus the stored
+            # features strictly ordered by lookup_key; only
+            # format_version 8 documents may carry these.
+            entry["online_feature_store"] = True
+            entry["online_features"] = [
+                {
+                    "lookup_key": lookup_key,
+                    "label": record["label"],
+                    "timestamp_ms": record["timestamp_ms"],
+                    "value": record["value"],
+                }
+                for lookup_key, record in sorted(self._features.items())
+            ]
         return entry
 
     @classmethod
@@ -1032,6 +1123,7 @@ class _Stream:
         allow_change_feed: bool = False,
         allow_batches: bool = False,
         allow_backpressure: bool = False,
+        allow_feature_store: bool = False,
     ) -> "_Stream":
         """Rebuild one stream from a snapshot entry or raise SnapshotError.
 
@@ -1047,6 +1139,9 @@ class _Stream:
         document). The backpressure field (``max_open_windows``) is only
         accepted when ``allow_backpressure`` is set (a version 6
         document), and the restored open base windows must not exceed it.
+        Feature-store fields (``online_feature_store``,
+        ``online_features``) are only accepted when
+        ``allow_feature_store`` is set (a version 8 document).
         """
         if not isinstance(data, dict):
             raise SnapshotError("stream entry must be an object")
@@ -1071,6 +1166,8 @@ class _Stream:
             allowed |= {"batch_retention", "batches"}
         if allow_backpressure:
             allowed |= {"max_open_windows"}
+        if allow_feature_store:
+            allowed |= {"online_feature_store", "online_features"}
         extra = sorted(set(data) - allowed)
         if extra:
             raise SnapshotError(f"stream entry has unexpected field: {extra[0]}")
@@ -1225,6 +1322,31 @@ class _Stream:
                 f"stream {name!r}: max_open_windows must be a positive integer"
             )
 
+        # The feature-store pair must appear together and only on joined
+        # streams; a document without it restores as a stream without an
+        # online feature store.
+        online_feature_store = data.get("online_feature_store")
+        if "online_feature_store" in data:
+            if online_feature_store is not True:
+                raise SnapshotError(
+                    f"stream {name!r}: online_feature_store must be true "
+                    f"when present"
+                )
+            if lookup_table is None:
+                raise SnapshotError(
+                    f"stream {name!r}: online_feature_store requires "
+                    f"lookup_table"
+                )
+            if "online_features" not in data:
+                raise SnapshotError(
+                    "stream entry missing required field: online_features"
+                )
+        elif "online_features" in data:
+            raise SnapshotError(
+                f"stream {name!r}: online_features present without "
+                f"online_feature_store"
+            )
+
         stream = cls(
             name,
             window_ms,
@@ -1236,6 +1358,7 @@ class _Stream:
             change_retention,
             batch_retention,
             max_open_windows,
+            online_feature_store is True,
         )
         stream.watermark = watermark
         stream.max_event_timestamp = max_event_timestamp
@@ -1311,6 +1434,9 @@ class _Stream:
 
         if batch_retention is not None:
             stream._load_batch_records(data["batches"])
+
+        if stream.online_feature_store:
+            stream._load_online_features(data["online_features"])
 
         if auto_lag is not None and max_event_timestamp is None:
             # No accepted event has ever happened, so no window can carry
@@ -1884,6 +2010,74 @@ class _Stream:
             )
         self._batches = parsed
 
+    def _load_online_features(self, records: object) -> None:
+        """Load stored online features under strict validation.
+
+        Every entry carries exactly ``lookup_key``/``label``/
+        ``timestamp_ms``/``value`` and the array is strictly ordered by
+        ``lookup_key``, which rejects duplicate and out-of-order keys
+        alike. Nothing is repaired.
+        """
+        if not isinstance(records, list):
+            raise SnapshotError(
+                f"stream {self.name!r}: online_features must be an array"
+            )
+        fields = {"lookup_key", "label", "timestamp_ms", "value"}
+        previous: str | None = None
+        for raw in records:
+            if not isinstance(raw, dict):
+                raise SnapshotError(
+                    f"stream {self.name!r}: online_features entries must be "
+                    f"objects"
+                )
+            extra = sorted(set(raw) - fields)
+            if extra:
+                raise SnapshotError(
+                    f"stream {self.name!r}: online feature has unexpected "
+                    f"field: {extra[0]}"
+                )
+            missing = sorted(fields - set(raw))
+            if missing:
+                raise SnapshotError(
+                    f"stream {self.name!r}: online feature missing field: "
+                    f"{missing[0]}"
+                )
+            lookup_key = raw["lookup_key"]
+            label = raw["label"]
+            timestamp_ms = raw["timestamp_ms"]
+            value = raw["value"]
+            if not isinstance(lookup_key, str) or not lookup_key:
+                raise SnapshotError(
+                    f"stream {self.name!r}: online feature lookup_key must be "
+                    f"a non-empty string"
+                )
+            if not isinstance(label, str) or not label:
+                raise SnapshotError(
+                    f"stream {self.name!r}: online feature label must be a "
+                    f"non-empty string"
+                )
+            if not _is_int(timestamp_ms):
+                raise SnapshotError(
+                    f"stream {self.name!r}: online feature timestamp_ms must "
+                    f"be an integer"
+                )
+            if not _is_finite_number(value):
+                raise SnapshotError(
+                    f"stream {self.name!r}: online feature value must be a "
+                    f"finite number"
+                )
+            if previous is not None and lookup_key <= previous:
+                raise SnapshotError(
+                    f"stream {self.name!r}: online_features must be strictly "
+                    f"ordered by lookup_key"
+                )
+            previous = lookup_key
+            self._features[lookup_key] = {
+                "label": label,
+                "timestamp_ms": timestamp_ms,
+                "value": value,
+            }
+
     def _parse_batch_request(self, raw: object, batch_id: str) -> dict:
         if not isinstance(raw, dict):
             raise SnapshotError(
@@ -2251,6 +2445,7 @@ class Service:
         change_retention: int | None = None,
         batch_retention: int | None = None,
         max_open_windows: int | None = None,
+        online_feature_store: bool = False,
     ) -> dict:
         with self._lock:
 
@@ -2270,6 +2465,7 @@ class Service:
                     change_retention,
                     batch_retention,
                     max_open_windows,
+                    online_feature_store,
                 )
 
             self._commit_locked(commit)
@@ -2292,6 +2488,8 @@ class Service:
             payload["batch_retention"] = batch_retention
         if max_open_windows is not None:
             payload["max_open_windows"] = max_open_windows
+        if online_feature_store:
+            payload["online_feature_store"] = True
         return payload
 
     def stream_features(self, name: str) -> dict | None:
@@ -2419,6 +2617,30 @@ class Service:
             rows = [dict(row) for row in stream._joined_finalized]
         return {"stream": name, "results": rows}
 
+    def feature(self, name: str, lookup_key: str) -> dict:
+        """Read the stored online feature of one lookup key.
+
+        The read happens under the service lock, so it only ever
+        observes complete commits. Unknown streams raise
+        StreamNotFoundError, streams without the store raise
+        FeatureStoreNotEnabledError, and a key no accepted event has
+        stored yet raises FeatureNotFoundError.
+        """
+        with self._lock:
+            stream = self._get(name)
+            if not stream.online_feature_store:
+                raise FeatureStoreNotEnabledError(name)
+            record = stream._features.get(lookup_key)
+            if record is None:
+                raise FeatureNotFoundError(lookup_key)
+            return {
+                "stream": name,
+                "lookup_key": lookup_key,
+                "label": record["label"],
+                "timestamp_ms": record["timestamp_ms"],
+                "value": record["value"],
+            }
+
     def pressure(self, name: str) -> dict:
         """Open-window pressure of a backpressured stream.
 
@@ -2515,6 +2737,10 @@ class Service:
         The whole document is assembled while holding the service lock, so
         concurrent creates, events and watermark advances are either fully
         included or fully excluded. Instances with at least one
+        feature-store stream export ``format_version`` 8 (always
+        carrying the ``tables`` array, and
+        ``online_feature_store``/``online_features`` on the enabled
+        streams); otherwise instances with at least one
         CDC-enabled table export ``format_version`` 7 (always carrying
         the ``tables`` array, and ``cdc_retention``/``latest_cdc_seq``/
         ``cdc_changes`` on the enabled tables); otherwise instances with
@@ -2540,6 +2766,14 @@ class Service:
             self._streams[name].to_snapshot() for name in sorted(self._streams)
         ]
         tables = [self._table_to_snapshot(name) for name in sorted(self._tables)]
+        if any(
+            stream.online_feature_store for stream in self._streams.values()
+        ):
+            return {
+                "format_version": SNAPSHOT_FORMAT_VERSION_FEATURES,
+                "tables": tables,
+                "streams": streams,
+            }
         if any(
             table.cdc_retention is not None for table in self._tables.values()
         ):
@@ -2653,7 +2887,11 @@ class Service:
         stream whose open base windows must not exceed it) under strict
         validation; version 7 documents additionally restore table CDC
         state (retention, cursor and retained records, with at least one
-        enabled table) under strict validation. Returns the restored
+        enabled table) under strict validation; version 8 documents
+        additionally restore online feature stores (the per-stream flag
+        and the stored features, with at least one enabled stream whose
+        ``lookup_table`` references a restored table) under strict
+        validation. Returns the restored
         stream count.
         """
         with self._lock:
@@ -2694,6 +2932,7 @@ class Service:
             SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
             SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
             SNAPSHOT_FORMAT_VERSION_TABLE_CDC,
+            SNAPSHOT_FORMAT_VERSION_FEATURES,
         )
         if version == SNAPSHOT_FORMAT_VERSION:
             allowed = {"format_version", "streams"}
@@ -2725,9 +2964,16 @@ class Service:
                         SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
                         SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
                         SNAPSHOT_FORMAT_VERSION_TABLE_CDC,
+                        SNAPSHOT_FORMAT_VERSION_FEATURES,
                     )
                 ),
-                allow_cdc=(version == SNAPSHOT_FORMAT_VERSION_TABLE_CDC),
+                allow_cdc=(
+                    version
+                    in (
+                        SNAPSHOT_FORMAT_VERSION_TABLE_CDC,
+                        SNAPSHOT_FORMAT_VERSION_FEATURES,
+                    )
+                ),
             )
         if version == SNAPSHOT_FORMAT_VERSION_TABLE_CDC and not any(
             table.cdc_retention is not None for table in tables.values()
@@ -2752,6 +2998,7 @@ class Service:
                     SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
                     SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
                     SNAPSHOT_FORMAT_VERSION_TABLE_CDC,
+                    SNAPSHOT_FORMAT_VERSION_FEATURES,
                 ),
                 allow_batches=version
                 in (
@@ -2759,14 +3006,17 @@ class Service:
                     SNAPSHOT_FORMAT_VERSION_VERSIONED_TABLES,
                     SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
                     SNAPSHOT_FORMAT_VERSION_TABLE_CDC,
+                    SNAPSHOT_FORMAT_VERSION_FEATURES,
                 ),
                 allow_backpressure=(
                     version
                     in (
                         SNAPSHOT_FORMAT_VERSION_BACKPRESSURE,
                         SNAPSHOT_FORMAT_VERSION_TABLE_CDC,
+                        SNAPSHOT_FORMAT_VERSION_FEATURES,
                     )
                 ),
+                allow_feature_store=(version == SNAPSHOT_FORMAT_VERSION_FEATURES),
             )
             if stream.name in restored:
                 raise SnapshotError(
@@ -2782,6 +3032,13 @@ class Service:
             raise SnapshotError(
                 "format_version 6 requires at least one stream with "
                 "max_open_windows"
+            )
+        if version == SNAPSHOT_FORMAT_VERSION_FEATURES and not any(
+            stream.online_feature_store for stream in restored.values()
+        ):
+            raise SnapshotError(
+                "format_version 8 requires at least one stream with "
+                "online_feature_store"
             )
         self._tables = tables
         self._streams = restored
